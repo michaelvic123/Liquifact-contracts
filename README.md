@@ -40,18 +40,18 @@ For CI and local checks you only need Rust and `cargo`.
 
 ## Development
 
-| Command           | Description                    |
-|-------------------|--------------------------------|
-| `cargo build`     | Build all contracts            |
-| `cargo test`      | Run unit tests                 |
-| `cargo fmt`       | Format code                    |
-| `cargo fmt -- --check` | Check formatting (used in CI) |
+| Command                | Description                                                |
+|------------------------|------------------------------------------------------------|
+| `cargo build`          | Build all contracts                                        |
+| `cargo test`           | Run unit tests and property-based tests (using `proptest`) |
+| `cargo fmt`            | Format code                                                |
+| `cargo fmt -- --check` | Check formatting (used in CI)                              |
 
 ---
 
 ## Project structure
 
-```
+```text
 liquifact-contracts/
 ├── Cargo.toml           # Workspace definition
 ├── escrow/
