@@ -30,6 +30,33 @@
 //!   performing any read-modify-write on ledger entries.
 //! * MINOR / PATCH bumps are safe for existing deployments; clients that
 //!   understand `"1.0.0"` can consume `"1.1.0"` without modification.
+//!
+//! ## Emergency Pause Mechanism
+//!
+//! This contract exposes a governance-controlled pause switch (Issue #24) that
+//! allows an authorised **admin** to temporarily block [`EscrowContract::fund`]
+//! and [`EscrowContract::settle`] during incident response ("break-glass").
+//!
+//! ### Pause semantics
+//!
+//! | State      | `fund()` | `settle()` | `pause()` | `unpause()` | `is_paused()` |
+//! |------------|----------|------------|-----------|-------------|---------------|
+//! | Unpaused   | ✅        | ✅          | ✅ (admin) | ❌ (no-op panics) | `false` |
+//! | Paused     | ❌        | ❌          | ❌ (no-op panics) | ✅ (admin) | `true` |
+//!
+//! ### Break-glass assumptions
+//!
+//! * **Admin is set at `init` time** and stored in [`ContractState`].  There is
+//!   no on-chain admin rotation in this version (MAJOR bump required if added).
+//! * Pause state is stored in [`ContractState::paused`].  It defaults to
+//!   `false`; the contract starts unpaused.
+//! * Only the designated admin address may call `pause()` or `unpause()`.
+//!   Any other caller panics with `"caller is not admin"`.
+//! * `pause()` on an already-paused contract panics (`"contract already paused"`).
+//! * `unpause()` on an already-unpaused contract panics (`"contract not paused"`).
+//! * `is_paused()` is read-only; any caller may invoke it at any time.
+//! * Read-only methods (`version`, `get_escrow`, `is_paused`) are **never**
+//!   blocked by the pause — only state-mutating investor operations are.
 
 /// Semantic version of this contract binary.
 ///
@@ -37,7 +64,7 @@
 /// * **MAJOR** — breaking change to the public ABI or storage schema.
 /// * **MINOR** — new, backwards-compatible functionality.
 /// * **PATCH** — bug-fix / docs only; no behaviour change.
-pub const CONTRACT_VERSION: &str = "1.0.0";
+pub const CONTRACT_VERSION: &str = "1.1.0";
 
 // ---------------------------------------------------------------------------
 // Minimal no-std / no-soroban-sdk stub types so the contract logic and tests
@@ -63,6 +90,44 @@ impl SorobanString {
 /// Minimal Env stub — real Soroban SDK provides a richer type.
 #[derive(Default, Clone)]
 pub struct Env;
+
+// ---------------------------------------------------------------------------
+// Governance / pause types
+// ---------------------------------------------------------------------------
+
+/// Opaque address type — in production this wraps `soroban_sdk::Address`.
+///
+/// Equality is checked by comparing the inner string, which represents the
+/// Stellar account ID (e.g. `"GADMIN…"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Address(pub std::string::String);
+
+impl Address {
+    /// Construct an [`Address`] from a Stellar account ID string.
+    pub fn from_string(s: &str) -> Self {
+        Address(s.to_string())
+    }
+}
+
+/// Top-level mutable state for the escrow contract.
+///
+/// In a real Soroban deployment this would live in persistent ledger storage
+/// keyed by a well-known symbol.  For the purpose of this in-process stub the
+/// caller holds and passes a `&mut ContractState`.
+///
+/// # Fields
+///
+/// * `admin`  — The address authorised to call `pause` / `unpause`.
+///              Set once at `init_with_admin`; immutable thereafter.
+/// * `paused` — Whether the contract is currently paused.
+///              Defaults to `false` (unpaused).
+#[derive(Debug, Clone)]
+pub struct ContractState {
+    /// Governance address authorised to trigger emergency pause / unpause.
+    pub admin: Address,
+    /// `true` while the contract is in the paused (emergency-stop) state.
+    pub paused: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Escrow domain types
@@ -122,13 +187,13 @@ impl EscrowContract {
     ///
     /// let env = Env::default();
     /// let version = EscrowContract::version(&env);
-    /// assert_eq!(version.to_string(), "1.0.0");
+    /// assert_eq!(version.to_string(), "1.1.0");
     /// ```
     ///
     /// # Tooling / migration guidance
     ///
     /// ```text
-    /// const MIN_SUPPORTED: &str = "1.0.0";
+    /// const MIN_SUPPORTED: &str = "1.1.0";
     ///
     /// let v = contract.version(&env).to_string();
     /// assert!(semver_compat(&v, MIN_SUPPORTED), "contract too old: {v}");
@@ -142,6 +207,108 @@ impl EscrowContract {
     ///   embedded in the WASM binary.
     pub fn version(env: &Env) -> SorobanString {
         SorobanString::from_str(env, CONTRACT_VERSION)
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance: Emergency Pause (Issue #24)
+    // -----------------------------------------------------------------------
+
+    /// Initialise contract-level governance state with a designated admin.
+    ///
+    /// Call this **once** after deploying the contract.  The returned
+    /// [`ContractState`] must be persisted and threaded through every
+    /// subsequent call to `pause`, `unpause`, `fund`, and `settle`.
+    ///
+    /// # Arguments
+    ///
+    /// * `admin` — Stellar address that will be authorised to pause / unpause.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use escrow::{EscrowContract, Address};
+    ///
+    /// let state = EscrowContract::init_with_admin(Address::from_string("GADMIN"));
+    /// assert!(!state.paused);
+    /// ```
+    pub fn init_with_admin(admin: Address) -> ContractState {
+        ContractState {
+            admin,
+            paused: false,
+        }
+    }
+
+    /// Pause the contract, blocking `fund` and `settle` until unpaused.
+    ///
+    /// This is a **break-glass** operation for incident response.  Only the
+    /// admin address recorded in [`ContractState`] may call it.
+    ///
+    /// # Arguments
+    ///
+    /// * `state`  — Mutable governance state (holds admin and pause flag).
+    /// * `caller` — Address attempting the pause; must equal `state.admin`.
+    ///
+    /// # Panics
+    ///
+    /// * `"caller is not admin"` — if `caller != state.admin`.
+    /// * `"contract already paused"` — if `state.paused` is already `true`.
+    ///
+    /// # Security
+    ///
+    /// * Admin-only: any non-admin caller is rejected before any state change.
+    /// * Idempotency guard: double-pause panics to surface operator mistakes
+    ///   (e.g. a script that calls pause twice) rather than silently succeeding.
+    /// * No other state is mutated; escrow records are untouched.
+    pub fn pause(state: &mut ContractState, caller: &Address) {
+        assert!(caller == &state.admin, "caller is not admin");
+        assert!(!state.paused, "contract already paused");
+        state.paused = true;
+    }
+
+    /// Unpause the contract, re-enabling `fund` and `settle`.
+    ///
+    /// Only the admin address recorded in [`ContractState`] may call it.
+    ///
+    /// # Arguments
+    ///
+    /// * `state`  — Mutable governance state (holds admin and pause flag).
+    /// * `caller` — Address attempting the unpause; must equal `state.admin`.
+    ///
+    /// # Panics
+    ///
+    /// * `"caller is not admin"` — if `caller != state.admin`.
+    /// * `"contract not paused"` — if `state.paused` is already `false`.
+    ///
+    /// # Security
+    ///
+    /// * Admin-only: same access control as `pause`.
+    /// * Idempotency guard: double-unpause panics for the same reason as
+    ///   double-pause.
+    pub fn unpause(state: &mut ContractState, caller: &Address) {
+        assert!(caller == &state.admin, "caller is not admin");
+        assert!(state.paused, "contract not paused");
+        state.paused = false;
+    }
+
+    /// Return `true` if the contract is currently paused.
+    ///
+    /// This is a **read-only** method — any caller may invoke it at any time,
+    /// regardless of pause state.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use escrow::{EscrowContract, Address};
+    ///
+    /// let admin = Address::from_string("GADMIN");
+    /// let mut state = EscrowContract::init_with_admin(admin.clone());
+    /// assert!(!EscrowContract::is_paused(&state));
+    ///
+    /// EscrowContract::pause(&mut state, &admin);
+    /// assert!(EscrowContract::is_paused(&state));
+    /// ```
+    pub fn is_paused(state: &ContractState) -> bool {
+        state.paused
     }
 
     // -----------------------------------------------------------------------
@@ -186,9 +353,11 @@ impl EscrowContract {
     ///
     /// # Panics
     ///
+    /// * `"contract is paused"` — if the contract is in the emergency-stop state.
     /// * `fund_amount` must be > 0.
     /// * Escrow must not already be `Settled`.
-    pub fn fund(escrow: &mut Escrow, fund_amount: i128) {
+    pub fn fund(state: &ContractState, escrow: &mut Escrow, fund_amount: i128) {
+        assert!(!state.paused, "contract is paused");
         assert!(fund_amount > 0, "fund_amount must be positive");
         assert!(
             escrow.status != EscrowStatus::Settled,
@@ -205,8 +374,10 @@ impl EscrowContract {
     ///
     /// # Panics
     ///
+    /// * `"contract is paused"` — if the contract is in the emergency-stop state.
     /// * Escrow must be in `Funded` status before settlement.
-    pub fn settle(escrow: &mut Escrow) {
+    pub fn settle(state: &ContractState, escrow: &mut Escrow) {
+        assert!(!state.paused, "contract is paused");
         assert!(
             escrow.status == EscrowStatus::Funded,
             "escrow must be funded before settlement"

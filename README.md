@@ -60,13 +60,65 @@ liquifact-contracts/
 
 ### Escrow contract (high level)
 
-| Method        | Description                                                                 |
-|---------------|-----------------------------------------------------------------------------|
-| `version`     | **Read-only.** Returns semantic version string (`"MAJOR.MINOR.PATCH"`).    |
-| `init`        | Create an invoice escrow (invoice id, SME address, amount, yield bps, maturity). |
-| `get_escrow`  | Read current escrow state.                                                  |
-| `fund`        | Record investor funding; status becomes `Funded` when target is met.       |
-| `settle`      | Mark escrow as settled (buyer paid; investors receive principal + yield).   |
+| Method              | Auth    | Description                                                                   |
+|---------------------|---------|-------------------------------------------------------------------------------|
+| `version`           | Anyone  | **Read-only.** Returns semantic version string (`"MAJOR.MINOR.PATCH"`).      |
+| `init_with_admin`   | Anyone  | Initialise governance state; sets the admin address and starts unpaused.     |
+| `pause`             | Admin   | Emergency-stop: blocks `fund` and `settle` until unpaused.                   |
+| `unpause`           | Admin   | Lift the emergency stop; re-enables `fund` and `settle`.                     |
+| `is_paused`         | Anyone  | **Read-only.** Returns `true` while the contract is in emergency-stop state. |
+| `init`              | Anyone  | Create an invoice escrow (invoice id, SME address, amount, yield bps, maturity). |
+| `get_escrow`        | Anyone  | **Read-only.** Returns current escrow state.                                 |
+| `fund`              | Anyone  | Record investor funding; blocked when paused; status → `Funded` when target met. |
+| `settle`            | Anyone  | Mark escrow settled; blocked when paused; requires `Funded` status.          |
+
+---
+
+## Emergency Pause Mechanism (`pause` / `unpause` / `is_paused`)
+
+### Overview
+
+The contract exposes a governance-controlled pause switch (Issue #24) for
+incident response. A designated **admin** address can halt all investor
+operations instantly and restore them once the incident is resolved.
+
+```rust
+let admin = Address::from_string("GADMIN...");
+let mut state = EscrowContract::init_with_admin(admin.clone());
+
+// Incident detected — block fund and settle immediately.
+EscrowContract::pause(&mut state, &admin);
+assert!(EscrowContract::is_paused(&state));
+
+// Incident resolved — restore normal operation.
+EscrowContract::unpause(&mut state, &admin);
+assert!(!EscrowContract::is_paused(&state));
+```
+
+### Pause semantics
+
+| State    | `fund()` | `settle()` | `pause()`  | `unpause()` | `is_paused()` |
+|----------|----------|------------|------------|-------------|---------------|
+| Unpaused | ✅        | ✅          | ✅ (admin) | ❌ panics   | `false`       |
+| Paused   | ❌ panics | ❌ panics   | ❌ panics  | ✅ (admin)  | `true`        |
+
+### Security properties
+
+| Property                | Detail                                                                    |
+|-------------------------|---------------------------------------------------------------------------|
+| Admin-only access       | Any non-admin caller is rejected before any state is changed.             |
+| Idempotency guards      | Double-pause and double-unpause both panic — surfaces operator mistakes.  |
+| Read-only methods unblocked | `version`, `get_escrow`, `is_paused` are always accessible.          |
+| No privilege escalation | Admin is set once at `init_with_admin`; cannot be rotated in this version.|
+| No silent no-ops        | Every pause/unpause call either mutates state or panics — never silently skips. |
+
+### Break-glass workflow
+
+1. Admin detects incident → calls `pause(state, admin)`.
+2. All `fund` and `settle` calls revert with `"contract is paused"`.
+3. Incident resolved → admin calls `unpause(state, admin)`.
+4. Normal operations resume immediately.
+5. Tooling can poll `is_paused()` (read-only, zero-cost) to monitor status.
 
 ---
 
