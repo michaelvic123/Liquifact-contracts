@@ -76,11 +76,29 @@ liquifact-contracts/
 
 GitHub Actions runs on every push and pull request to `main`:
 
-- **Format** — `cargo fmt --all -- --check`
-- **Build** — `cargo build`
-- **Tests** — `cargo test`
+| Step | Command | Fails if… |
+|------|---------|-----------|
+| Format | `cargo fmt --all -- --check` | any file is not formatted |
+| Build | `cargo build` | compilation error |
+| Tests | `cargo test` | any test fails |
+| Coverage | `cargo llvm-cov --features testutils --fail-under-lines 95` | line coverage < 95 % |
 
-Keep formatting and tests passing before opening a PR.
+### Coverage gate
+
+The pipeline uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (installed via `taiki-e/install-action`) to measure line coverage and hard-fail the job when it drops below **95 %**.
+
+To run the coverage check locally:
+
+```bash
+# Install once
+cargo install cargo-llvm-cov
+
+# Run (requires llvm-tools-preview component)
+rustup component add llvm-tools-preview
+cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only
+```
+
+Keep formatting, tests, and coverage passing before opening a PR.
 
 ---
 
