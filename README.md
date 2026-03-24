@@ -70,10 +70,28 @@ liquifact-contracts/
 
 ### Escrow contract (high level)
 
-- **init** — Create an invoice escrow (invoice id, SME address, amount, yield bps, maturity).
-- **get_escrow** — Read current escrow state.
-- **fund** — Record investor funding; status becomes “funded” when target is met.
-- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield).
+- **init** — Create an invoice escrow (admin, invoice id, SME address, amount, yield bps, maturity). Requires `admin` authorization.
+- **get_escrow** — Read current escrow state (no auth required).
+- **fund** — Record investor funding; status becomes “funded” when target is met. Requires `investor` authorization.
+- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield). Requires `sme_address` authorization.
+
+### Authorization model
+
+All sensitive state transitions are protected by Soroban's native [`require_auth`](https://developers.stellar.org/docs/smart-contracts/example-contracts/auth) mechanism.
+
+| Function | Required Signer  | Rationale                                                  |
+|----------|------------------|------------------------------------------------------------|
+| `init`   | `admin`          | Prevents unauthorized escrow creation or re-initialization |
+| `fund`   | `investor`       | Each investor authorizes their own contribution            |
+| `settle` | `sme_address`    | Only the SME beneficiary may trigger settlement            |
+
+`require_auth` integrates with Soroban's authorization framework: on-chain, the transaction must carry a valid signature (or sub-invocation auth) from the required address. In tests, `env.mock_all_auths()` satisfies all checks so happy-path logic can be verified independently of key management.
+
+#### Security assumptions
+
+- The `admin` address is trusted to create legitimate escrows. Rotate or use a multisig address in production.
+- Re-initialization is blocked at the contract level (`"Escrow already initialized"` panic) regardless of who calls `init`.
+- `settle` can only move status from `1 → 2`; calling it on an open or already-settled escrow panics.
 
 ---
 
