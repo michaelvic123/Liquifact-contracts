@@ -90,7 +90,7 @@ All sensitive state transitions are protected by Soroban's native [`require_auth
 #### Security assumptions
 
 - The `admin` address is trusted to create legitimate escrows. Rotate or use a multisig address in production.
-- Re-initialization is blocked at the contract level (`"Escrow already initialized"` panic) regardless of who calls `init`.
+ - Re-initialization is blocked at the contract level (`"LiquifactEscrow(INV): already initialized"` panic) regardless of who calls `init`.
 - `settle` can only move status from `1 → 2`; calling it on an open or already-settled escrow panics.
 
 ---

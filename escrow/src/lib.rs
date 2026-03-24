@@ -66,10 +66,9 @@ impl LiquifactEscrow {
         admin.require_auth();
 
         // Prevent re-initialization — escrow must not already exist.
-        assert!(
-            !env.storage().instance().has(&symbol_short!("escrow")),
-            "Escrow already initialized"
-        );
+        if env.storage().instance().has(&symbol_short!("escrow")) {
+            panic!("LiquifactEscrow({}): already initialized", invoice_id);
+        };
 
         let escrow = InvoiceEscrow {
             invoice_id: invoice_id.clone(),
@@ -93,7 +92,7 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .get(&symbol_short!("escrow"))
-            .unwrap_or_else(|| panic!("Escrow not initialized"))
+            .unwrap_or_else(|| panic!("LiquifactEscrow(global): not initialized"))
     }
 
     /// Record investor funding. In production, this would be called with token transfer.
@@ -109,7 +108,9 @@ impl LiquifactEscrow {
         investor.require_auth();
 
         let mut escrow = Self::get_escrow(env.clone());
-        assert!(escrow.status == 0, "Escrow not open for funding");
+        if escrow.status != 0 {
+            panic!("LiquifactEscrow({}): expected status=0(open), got={}", escrow.invoice_id, escrow.status);
+        };
         escrow.funded_amount += amount;
         if escrow.funded_amount >= escrow.funding_target {
             escrow.status = 1; // funded - ready to release to SME
@@ -135,10 +136,9 @@ impl LiquifactEscrow {
         // Auth boundary: only the SME (payee) may settle the escrow.
         escrow.sme_address.require_auth();
 
-        assert!(
-            escrow.status == 1,
-            "Escrow must be funded before settlement"
-        );
+        if escrow.status != 1 {
+            panic!("LiquifactEscrow({}): expected status=1(funded), got={}", escrow.invoice_id, escrow.status);
+        };
         escrow.status = 2; // settled
         env.storage()
             .instance()

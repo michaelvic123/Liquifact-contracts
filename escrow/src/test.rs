@@ -244,7 +244,7 @@ fn test_settle_unauthorized_panics() {
 
 /// Re-initializing an already-initialized escrow must panic.
 #[test]
-#[should_panic(expected = "Escrow already initialized")]
+#[should_panic(expected = "LiquifactEscrow(INV009): already initialized")]
 fn test_double_init_panics() {
     let (_, client, admin, sme) = setup();
 
@@ -288,7 +288,7 @@ fn test_fund_after_funded_panics() {
 
 /// Settling an escrow that is still open (not yet funded) must panic.
 #[test]
-#[should_panic(expected = "Escrow must be funded before settlement")]
+#[should_panic(expected = "LiquifactEscrow(INV011): expected status=1(funded), got=0")]
 fn test_settle_before_funded_panics() {
     let (_, client, admin, sme) = setup();
 
@@ -305,7 +305,7 @@ fn test_settle_before_funded_panics() {
 
 /// `get_escrow` on an uninitialized contract must panic.
 #[test]
-#[should_panic(expected = "Escrow not initialized")]
+#[should_panic(expected = "LiquifactEscrow(global): not initialized")]
 fn test_get_escrow_uninitialized_panics() {
     let env = Env::default();
     let contract_id = env.register(LiquifactEscrow, ());
