@@ -481,6 +481,55 @@ impl LiquifactEscrow {
 
         escrow
     }
+
+    /// Withdraw funded liquidity to the SME wallet.
+    ///
+    /// Allows the configured SME address to withdraw the funded amount once the
+    /// funding target has been reached. This transfers the liquidity to the SME
+    /// while preserving the escrow state for later settlement when the buyer pays.
+    ///
+    /// # Authorization
+    /// Requires authorization from the `sme_address` stored in the escrow.
+    /// Only the SME that is the beneficiary of the escrow may withdraw the funded amount,
+    /// preventing unauthorized withdrawals.
+    ///
+    /// # Panics
+    /// - If the escrow is not in the funded (status = 1) state.
+    /// - If the escrow has already been withdrawn (status = 3).
+    ///
+    /// # Returns
+    /// The funded amount that was withdrawn to the SME.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // After funding target is met (status = 1)
+    /// let amount = client.withdraw();
+    /// // SME receives the funded_amount; status changes to 3 (withdrawn)
+    /// ```
+    pub fn withdraw(env: Env) -> i128 {
+        let mut escrow = Self::get_escrow(env.clone());
+
+        // Auth boundary: only the SME (beneficiary) may withdraw the funded amount.
+        escrow.sme_address.require_auth();
+
+        assert!(
+            escrow.status == 1,
+            "Escrow must be funded before withdrawal"
+        );
+        assert!(
+            escrow.funded_amount > 0,
+            "No funds available for withdrawal"
+        );
+
+        let withdrawal_amount = escrow.funded_amount;
+        escrow.status = 3; // withdrawn - SME has received the funds
+        escrow.funded_amount = 0; // Clear funded amount after withdrawal
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &escrow);
+
+        withdrawal_amount
+    }
 }
 
 // ---------------------------------------------------------------------------

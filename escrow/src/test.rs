@@ -858,7 +858,7 @@ fn test_yield_bps_stored() {
     let sme = Address::generate(&env);
 
 #[test]
-#[should_panic(expected = "Escrow must be funded before settlement")]
+#[should_panic(expected = "Escrow must be funded or withdrawn before settlement")]
 fn test_settle_before_funded_panics() {
     let (_, client, admin, sme) = setup();
     client.init(
