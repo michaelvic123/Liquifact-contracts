@@ -40,21 +40,18 @@ fn event_topic0(env: &Env, n: usize) -> soroban_sdk::Symbol {
 fn test_init_and_get_escrow() {
     let env = Env::default();
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let (client, _) = deploy(&env);
 
-    let escrow = client.create_escrow(
-        &admin,
-        &symbol_short!("F001"),
+    let escrow = client.init(
+        &symbol_short!("INV001"),
         &sme,
-        &10_000i128,
+        &10_000_0000000i128,
         &800i64,
         &1000u64,
     );
 
-    assert_eq!(escrow.invoice_id, symbol_short!("F001"));
-    assert_eq!(escrow.admin, admin);
+    assert_eq!(escrow.invoice_id, symbol_short!("INV001"));
     assert_eq!(escrow.amount, 10_000_0000000i128);
     assert_eq!(escrow.funded_amount, 0);
     assert_eq!(escrow.status, 0);
@@ -63,64 +60,21 @@ fn test_init_and_get_escrow() {
     assert_eq!(got.invoice_id, escrow.invoice_id);
 }
 
-/// Factory isolates multiple escrows — each invoice is independent.
 #[test]
 fn test_fund_and_settle() {
     let env = Env::default();
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let investor = Address::generate(&env);
     let (client, _) = deploy(&env);
 
-    client.create_escrow(
-        &admin,
-        &symbol_short!("F002"),
+    client.init(
+        &symbol_short!("INV002"),
         &sme,
-        &1_000i128,
-        &500i64,
-        &500u64,
+        &10_000_0000000i128,
+        &800i64,
+        &1000u64,
     );
-    client.create_escrow(
-        &admin,
-        &symbol_short!("F003"),
-        &sme2,
-        &2_000i128,
-        &600i64,
-        &600u64,
-    );
-
-    let e1 = client.get_escrow(&symbol_short!("F002"));
-    let e2 = client.get_escrow(&symbol_short!("F003"));
-
-    // Each escrow holds its own state independently.
-    assert_eq!(e1.amount, 1_000i128);
-    assert_eq!(e2.amount, 2_000i128);
-    assert_eq!(e1.sme_address, sme);
-    assert_eq!(e2.sme_address, sme2);
-}
-
-/// list_invoices returns all invoice IDs in creation order.
-#[test]
-fn test_factory_list_invoices() {
-    let (_, client, admin, sme) = factory_setup();
-
-    assert_eq!(client.list_invoices().len(), 0);
-
-    client.create_escrow(&admin, &symbol_short!("F004"), &sme, &1_000i128, &500i64, &500u64);
-    client.create_escrow(&admin, &symbol_short!("F005"), &sme, &2_000i128, &600i64, &600u64);
-
-    let list = client.list_invoices();
-    assert_eq!(list.len(), 2);
-    assert_eq!(list.get(0).unwrap(), symbol_short!("F004"));
-    assert_eq!(list.get(1).unwrap(), symbol_short!("F005"));
-}
-
-/// fund via factory updates funded_amount and flips status when target met.
-#[test]
-fn test_factory_fund_partial_then_full() {
-    let (env, client, admin, sme) = factory_setup();
-    let investor = Address::generate(&env);
 
     let escrow1 = client.fund(&investor, &10_000_0000000i128);
     assert_eq!(escrow1.funded_amount, 10_000_0000000i128);
@@ -130,97 +84,16 @@ fn test_factory_fund_partial_then_full() {
     assert_eq!(escrow2.status, 2);
 }
 
-// ── guard tests ───────────────────────────────────────────────────────────────
-
-#[test]
-#[should_panic(expected = "Escrow already initialized")]
-fn test_double_init_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let sme = Address::generate(&env);
-    let (client, _) = deploy(&env);
-
-    client.init(
-        &admin,
-        &symbol_short!("INV001"),
-        &sme,
-        &1_000i128,
-        &500i64,
-        &2000u64,
-    );
-    client.init(
-        &admin,
-        &symbol_short!("INV001"),
-        &sme,
-        &1_000i128,
-        &500i64,
-        &2000u64,
-    );
-}
-
-#[test]
-#[should_panic(expected = "Escrow not open for funding")]
-fn test_fund_after_funded_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let sme = Address::generate(&env);
-    let investor = Address::generate(&env);
-    let (client, _) = deploy(&env);
-
-    client.init(
-        &admin,
-        &symbol_short!("INV002"),
-        &sme,
-        &1_000i128,
-        &500i64,
-        &2000u64,
-    );
-    client.fund(&investor, &1_000i128);
-    client.fund(&investor, &1i128); // must panic
-}
-
-#[test]
-#[should_panic(expected = "Escrow must be funded before settlement")]
-fn test_settle_before_funded_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let sme = Address::generate(&env);
-    let (client, _) = deploy(&env);
-
-    client.init(
-        &admin,
-        &symbol_short!("INV003"),
-        &sme,
-        &1_000i128,
-        &500i64,
-        &2000u64,
-    );
-    client.settle();
-}
-
-#[test]
-#[should_panic(expected = "Escrow not initialized")]
-fn test_get_escrow_uninitialized_panics() {
-    let env = Env::default();
-    let (client, _) = deploy(&env);
-    client.get_escrow();
-}
-
 // ── event: init ───────────────────────────────────────────────────────────────
 
 #[test]
 fn test_init_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let (client, contract_id) = deploy(&env);
 
     client.init(
-        &admin,
         &symbol_short!("INV001"),
         &sme,
         &10_000_0000000i128,
@@ -259,13 +132,11 @@ fn test_init_emits_event() {
 fn test_fund_partial_emits_event_status_open() {
     let env = Env::default();
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let investor = Address::generate(&env);
     let (client, _) = deploy(&env);
 
     client.init(
-        &admin,
         &symbol_short!("INV003"),
         &sme,
         &10_000_0000000i128,
@@ -289,13 +160,11 @@ fn test_fund_partial_emits_event_status_open() {
 fn test_fund_full_emits_event_status_funded() {
     let env = Env::default();
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let investor = Address::generate(&env);
     let (client, _) = deploy(&env);
 
     client.init(
-        &admin,
         &symbol_short!("INV004"),
         &sme,
         &10_000_0000000i128,
@@ -315,13 +184,11 @@ fn test_fund_full_emits_event_status_funded() {
 fn test_settle_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let investor = Address::generate(&env);
     let (client, _) = deploy(&env);
 
     client.init(
-        &admin,
         &symbol_short!("INV005"),
         &sme,
         &10_000_0000000i128,
@@ -344,15 +211,12 @@ fn test_settle_emits_event() {
 #[test]
 fn test_event_topics_are_correct() {
     let env = Env::default();
-    // mock_all_auths only for setup steps.
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let investor = Address::generate(&env);
     let (client, _) = deploy(&env);
 
     client.init(
-        &admin,
         &symbol_short!("INV006"),
         &sme,
         &10_000_0000000i128,
@@ -376,18 +240,16 @@ fn test_event_topics_are_correct() {
 fn test_two_partial_funds_emit_two_events() {
     let env = Env::default();
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let investor = Address::generate(&env);
     let (client, _) = deploy(&env);
 
     client.init(
-        &admin,
         &symbol_short!("INV007"),
         &sme,
-        &1_000i128,
-        &500i64,
-        &2000u64,
+        &10_000_0000000i128,
+        &800i64,
+        &1000u64,
     );
 
     client.fund(&investor, &3_000_0000000i128);
@@ -409,17 +271,15 @@ fn test_two_partial_funds_emit_two_events() {
 fn test_settle_before_funded_no_event() {
     let env = Env::default();
     env.mock_all_auths();
-    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let (client, _) = deploy(&env);
 
     client.init(
-        &admin,
         &symbol_short!("INV008"),
         &sme,
-        &5_000i128,
+        &10_000_0000000i128,
         &800i64,
-        &3000u64,
+        &1000u64,
     );
     client.settle();
 }
