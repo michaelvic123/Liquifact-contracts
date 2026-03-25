@@ -95,6 +95,44 @@ All sensitive state transitions are protected by Soroban's native [`require_auth
 
 ---
 
+## Admin transfer (governance rotation)
+
+Both `LiquifactEscrow` and `EscrowFactory` support secure rotation of the governance address via `transfer_admin`.
+
+### Entry points
+
+| Contract          | Signature                                              | Auth required    |
+|-------------------|--------------------------------------------------------|------------------|
+| `LiquifactEscrow` | `transfer_admin(new_admin)`                            | current `admin`  |
+| `EscrowFactory`   | `transfer_admin(invoice_id, new_admin)`                | current `admin`  |
+
+### Guards against accidental lockout
+
+| Check                              | Error message                              |
+|------------------------------------|--------------------------------------------|
+| Caller must be current admin       | Auth failure (Soroban native)              |
+| `new_admin` ≠ current admin        | `"New admin must differ from current admin"` |
+| Escrow must be initialized / exist | `"Escrow not initialized"` / `"Escrow not found for invoice"` |
+
+### Event
+
+On every successful transfer both contracts emit:
+
+```
+topics: ("admin", "transfer")
+data:   (old_admin: Address, new_admin: Address)
+```
+
+Off-chain observers can subscribe to this event to track governance rotation without polling storage.
+
+### Security assumptions
+
+- The caller supplies `new_admin` — ensure the target address is controlled before transferring.
+- No time-lock or two-step confirmation is enforced on-chain; callers should implement off-chain confirmation if required.
+- Once transferred, the old admin loses all governance privileges immediately.
+
+---
+
 ## Escrow Factory pattern
 
 The `EscrowFactory` contract (also in `escrow/src/lib.rs`) implements a **per-invoice factory** that registers and manages one isolated escrow record per invoice, removing the single-escrow-per-deployment limitation of the base `LiquifactEscrow` contract.

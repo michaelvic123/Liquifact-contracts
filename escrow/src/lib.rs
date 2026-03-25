@@ -6,11 +6,12 @@
 //!
 //! # Authorization Boundaries
 //!
-//! | Function | Required Signer        | Reason                                      |
-//! |----------|------------------------|---------------------------------------------|
-//! | `init`   | `admin`                | Only the designated admin may create escrows |
-//! | `fund`   | `investor`             | Investor authorizes their own funding action |
-//! | `settle` | `sme_address`          | Only the SME (payee) may trigger settlement  |
+//! | Function         | Required Signer        | Reason                                       |
+//! |------------------|------------------------|----------------------------------------------|
+//! | `init`           | `admin`                | Only the designated admin may create escrows  |
+//! | `fund`           | `investor`             | Investor authorizes their own funding action  |
+//! | `settle`         | `sme_address`          | Only the SME (payee) may trigger settlement   |
+//! | `transfer_admin` | current `admin`        | Only current admin may rotate governance addr |
 //!
 //! All auth checks are enforced via [`Address::require_auth`], which integrates
 //! with Soroban's native authorization framework and is verifiable on-chain.
@@ -117,6 +118,50 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&symbol_short!("escrow"), &escrow);
+        escrow
+    }
+
+    /// Transfer governance authority to a new admin address.
+    ///
+    /// # Authorization
+    /// Requires authorization from the **current** `admin` stored in the escrow.
+    /// This ensures only the legitimate governance holder can rotate the address.
+    ///
+    /// # Guards
+    /// - `new_admin` must differ from the current admin (prevents no-op transfers
+    ///   that could mask an accidental lockout attempt).
+    /// - Escrow must already be initialized.
+    ///
+    /// # Events
+    /// Emits `("admin", "transfer") → (old_admin, new_admin)` on success so
+    /// off-chain observers can track governance rotation without polling storage.
+    ///
+    /// # Panics
+    /// - If the escrow is not initialized.
+    /// - If `new_admin` equals the current admin.
+    /// - If the caller is not the current admin (auth failure).
+    pub fn transfer_admin(env: Env, new_admin: Address) -> InvoiceEscrow {
+        let mut escrow = Self::get_escrow(env.clone());
+
+        // Auth boundary: only the current admin may rotate governance.
+        escrow.admin.require_auth();
+
+        assert!(
+            escrow.admin != new_admin,
+            "New admin must differ from current admin"
+        );
+
+        let old_admin = escrow.admin.clone();
+        escrow.admin = new_admin.clone();
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &escrow);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("transfer")),
+            (old_admin, new_admin),
+        );
+
         escrow
     }
 
@@ -284,6 +329,47 @@ impl EscrowFactory {
         env.storage()
             .persistent()
             .set(&FactoryKey::Escrow(invoice_id), &escrow);
+        escrow
+    }
+
+    /// Transfer governance authority for a specific invoice escrow to a new admin.
+    ///
+    /// # Authorization
+    /// Requires authorization from the **current** admin of that invoice escrow.
+    ///
+    /// # Guards
+    /// - `new_admin` must differ from the current admin.
+    /// - The invoice escrow must already exist.
+    ///
+    /// # Events
+    /// Emits `("admin", "transfer") → (old_admin, new_admin)` on success.
+    ///
+    /// # Panics
+    /// - If no escrow exists for `invoice_id`.
+    /// - If `new_admin` equals the current admin.
+    /// - If the caller is not the current admin (auth failure).
+    pub fn transfer_admin(env: Env, invoice_id: Symbol, new_admin: Address) -> InvoiceEscrow {
+        let mut escrow = Self::get_escrow(env.clone(), invoice_id.clone());
+
+        // Auth boundary: only the current admin may rotate governance.
+        escrow.admin.require_auth();
+
+        assert!(
+            escrow.admin != new_admin,
+            "New admin must differ from current admin"
+        );
+
+        let old_admin = escrow.admin.clone();
+        escrow.admin = new_admin.clone();
+        env.storage()
+            .persistent()
+            .set(&FactoryKey::Escrow(invoice_id), &escrow);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("transfer")),
+            (old_admin, new_admin),
+        );
+
         escrow
     }
 
