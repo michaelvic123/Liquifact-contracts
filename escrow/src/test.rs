@@ -921,6 +921,7 @@ fn test_update_maturity_wrong_state() {
     let env = Env::default();
     env.mock_all_auths();
 
+    let admin = Address::generate(&env);
     let sme = Address::generate(&env);
     let admin = Address::generate(&env);
     let investor = Address::generate(&env);
