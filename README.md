@@ -1,63 +1,76 @@
-# LiquiFact Contracts
+# LiquiFact Escrow Contract – Threat Model & Security Notes
 
-Soroban smart contracts for **LiquiFact** — the global invoice liquidity network on Stellar. This repo contains the **escrow** contract that holds investor funds for tokenized invoices until settlement.
-
-Part of the LiquiFact stack: **frontend** (Next.js) | **backend** (Express) | **contracts** (this repo).
-
----
-
-## Prerequisites
-
-- **Rust** 1.70+ (stable)
-- **Soroban CLI** (optional, for deployment): [Stellar Soroban docs](https://developers.stellar.org/docs/smart-contracts/getting-started/soroban-cli)
-
-For CI and local checks you only need Rust and `cargo`.
+Soroban smart contracts for **LiquiFact** — the global invoice liquidity network on Stellar.
+This repo contains the **escrow** contract that holds investor funds for tokenized invoices until settlement.
 
 ---
 
-## Setup
+## Threat Model
 
-1. **Clone the repo**
+### 1. Unauthorized Access
 
-   ```bash
-   git clone <this-repo-url>
-   cd liquifact-contracts
-   ```
+**Risk:**
+- Anyone can call `fund` or `settle`
 
-2. **Build**
+**Impact:**
+- Malicious settlement
+- Fake funding events
 
-   ```bash
-   cargo build
-   ```
+**Mitigation (Current):**
+- None (mock auth used in tests)
 
-3. **Run tests**
-
-   ```bash
-   cargo test
-   ```
+**Recommended Controls:**
+- Require auth:
+  - `fund`: investor must authorize
+  - `settle`: only trusted role (e.g. admin/oracle)
 
 ---
 
-## Development
+### 2. Arithmetic Risks (Overflow / Underflow)
 
-| Command           | Description                    |
-|-------------------|--------------------------------|
-| `cargo build`     | Build all contracts            |
-| `cargo test`      | Run unit tests                 |
-| `cargo fmt`       | Format code                    |
-| `cargo fmt -- --check` | Check formatting (used in CI) |
+**Risk:**
+- `funded_amount += amount` may overflow `i128`
 
 ---
 
-## Project structure
+### 3. Replay / Double Execution
 
+```bash
+git clone <this-repo-url>
+cd liquifact-contracts
+cargo build
+cargo test
 ```
+
+---
+
+### 5. Invalid Input / Economic Attacks
+
+**Risks:**
+- Negative funding
+- Zero funding
+- Invalid maturity
+
+| Command                | Description                                                |
+|------------------------|------------------------------------------------------------|
+| `cargo build`          | Build all contracts                                        |
+| `cargo test`           | Run unit tests and property-based tests (using `proptest`) |
+| `cargo fmt`            | Format code                                                |
+| `cargo fmt -- --check` | Check formatting (used in CI)                              |
+
+---
+
+### 6. Time-based Attacks
+
+```text
 liquifact-contracts/
-├── Cargo.toml           # Workspace definition
+├── Cargo.toml              # Workspace definition
+├── docs/
+│   └── EVENT_SCHEMA.md    # Indexer-friendly event schema reference
 ├── escrow/
-│   ├── Cargo.toml       # Escrow contract crate
+│   ├── Cargo.toml          # Escrow contract crate
 │   └── src/
-│       ├── lib.rs       # LiquiFact escrow contract (init, fund, settle)
+│       ├── lib.rs       # LiquiFact escrow contract (init, fund, settle, migrate)
 │       └── test.rs      # Unit tests
 ├── docs/
 │   ├── openapi.yaml     # OpenAPI 3.1 specification
@@ -65,75 +78,154 @@ liquifact-contracts/
 │   └── tests/
 │       └── openapi.test.js  # Schema conformance tests (51 cases)
 └── .github/workflows/
-    └── ci.yml           # CI: fmt, build, test
+    └── ci.yml              # CI: fmt, build, test
 ```
 
-### Escrow contract (high level)
+Records an investor contribution. Transitions to `status = 1` when
+`funded_amount >= funding_target`.
 
-- **init** — Create an invoice escrow (admin, invoice id, SME address, amount, yield bps, maturity). Requires `admin` authorization.
-- **get_escrow** — Read current escrow state (no auth required).
-- **fund** — Record investor funding; status becomes “funded” when target is met. Requires `investor` authorization.
-- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield). Requires `sme_address` authorization.
+> **Production note:** Must be called atomically with a SEP-41 token `transfer`
+> from `investor` to the contract address. This version records accounting only.
 
-### Authorization model
+**Parameters**
 
-All sensitive state transitions are protected by Soroban's native [`require_auth`](https://developers.stellar.org/docs/smart-contracts/example-contracts/auth) mechanism.
+| Parameter   | Constraints                                  |
+|-------------|----------------------------------------------|
+| `_investor` | Investor's Stellar address (for audit trail) |
+| `amount`    | > 0 recommended; partial funding is allowed  |
 
-| Function | Required Signer  | Rationale                                                  |
-|----------|------------------|------------------------------------------------------------|
-| `init`   | `admin`          | Prevents unauthorized escrow creation or re-initialization |
-| `fund`   | `investor`       | Each investor authorizes their own contribution            |
-| `settle` | `sme_address`    | Only the SME beneficiary may trigger settlement            |
+**Returns** — Updated `InvoiceEscrow`.
 
-`require_auth` integrates with Soroban's authorization framework: on-chain, the transaction must carry a valid signature (or sub-invocation auth) from the required address. In tests, `env.mock_all_auths()` satisfies all checks so happy-path logic can be verified independently of key management.
+**Failure conditions**
 
-#### Security assumptions
+| Condition                 | Behaviour                               |
+|---------------------------|-----------------------------------------|
+| `status != 0`             | Panics: `"Escrow not open for funding"` |
+| `init` not called         | Panics: `"Escrow not initialized"`      |
+| `funded_amount` overflows | Rust panics (debug) / wraps (release)   |
 
-- The `admin` address is trusted to create legitimate escrows. Rotate or use a multisig address in production.
-- Re-initialization is blocked at the contract level (`"Escrow already initialized"` panic) regardless of who calls `init`.
-- `settle` can only move status from `1 → 2`; calling it on an open or already-settled escrow panics.
+**State transitions**
+
+- **init** — Create an invoice escrow (invoice id, SME address, admin address, amount, yield bps, maturity).
+- **get_escrow** — Read current escrow state.
+- **get_version** — Return the stored schema version number.
+- **fund** — Record investor funding; status becomes "funded" when target is met.
+- **settle** — Mark escrow as settled (buyer paid; investors receive principal + yield).
+- **migrate** — Upgrade storage from an older schema version to the current one (see below).
+
+### Edge-case test matrix (`escrow/src/test.rs`)
+
+Tests are tagged by risk category in inline comments:
+
+| Category  | Tag       | What is covered |
+|-----------|-----------|-----------------|
+| Happy path | `[HAPPY]` | Full lifecycle, field persistence, `get_escrow` consistency |
+| Auth       | `[AUTH]`  | `require_auth` recorded for admin / investor / SME; panics without auth |
+| State      | `[STATE]` | Double-init, fund-after-funded, fund-after-settled, settle-when-open, double-settle |
+| Uninitialized | `[UNINIT]` | `get_escrow`, `fund`, `settle` all panic before `init` |
+| Boundary   | `[BOUND]` | `amount=1`, `amount=i128::MAX`, `yield_bps=i64::MAX`, `maturity=0`, `maturity=u64::MAX`, overshoot funding, exact-boundary funding |
+| Repeated calls | `[REPEAT]` | Multiple investors accumulate correctly; `get_escrow` is idempotent |
 
 ---
 
-## API documentation (OpenAPI)
+## Contract migration strategy
 
-The REST API surface is documented in [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI 3.1).
+### Overview
 
-### Endpoints
+The escrow contract stores its state as a single [`InvoiceEscrow`](escrow/src/lib.rs) struct under the instance storage key `"escrow"`, alongside a `"version"` key that holds the current schema version (`u32`).
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET` | `/v1/health` | — | Liveness probe |
-| `GET` | `/v1/info` | — | API name, version, network |
-| `GET` | `/v1/invoices` | JWT | List invoice summaries (paginated) |
-| `GET` | `/v1/invoices/{invoiceId}` | JWT | Full escrow detail for one invoice |
-| `POST` | `/v1/escrow` | JWT | Initialise a new invoice escrow |
-| `POST` | `/v1/escrow/{invoiceId}/fund` | JWT | Record investor funding |
-| `POST` | `/v1/escrow/{invoiceId}/settle` | JWT | Settle a funded escrow |
+Any change to the struct layout (adding, removing, or retyping a field) is a **breaking schema change** and requires a version bump and a migration path.
 
-### Security
+### Version history
 
-- All mutating and data endpoints require a `Bearer` JWT in the `Authorization` header.
-- `/health` and `/info` are public (no auth required).
-- Stellar addresses are validated as 56-char base32 (`[A-Z2-7]`) strings.
-- Monetary amounts are always in stroops (smallest unit); `amount ≥ 1` is enforced.
-- `yield_bps` is capped at `10000` (100 %) to prevent overflow.
+| Version | Description |
+|---------|-------------|
+| 1       | Initial schema — `invoice_id`, `sme_address`, `amount`, `funding_target`, `funded_amount`, `yield_bps`, `maturity`, `status`, `version` |
 
-### Running the schema conformance tests
+### How versioning works
 
-```bash
-cd docs
-npm install
-npm test
-# tests 51 | pass 51 | fail 0
+- `SCHEMA_VERSION` in `lib.rs` is the source of truth for the current schema.
+- Every `init` call writes `SCHEMA_VERSION` into both the struct's `version` field and the `"version"` storage key.
+- `get_version()` lets off-chain tooling (indexers, upgrade scripts) read the stored version before deciding whether to call `migrate`.
+
+### Adding a new schema version (step-by-step)
+
+1. **Bump `SCHEMA_VERSION`** in `lib.rs` (e.g. `1` to `2`).
+2. **Keep the old struct** — add a `legacy` module (or a type alias like `InvoiceEscrowV1`) so the old bytes can still be deserialized.
+3. **Add a migration arm** in `LiquifactEscrow::migrate`:
+   ```rust
+   if from_version == 1 {
+       let old: InvoiceEscrowV1 = env.storage().instance()
+           .get(&symbol_short!("escrow")).unwrap();
+       let new = InvoiceEscrow {
+           // spread old fields, default new ones
+           new_field: default_value,
+           version: 2,
+           ..old.into()
+       };
+       env.storage().instance().set(&symbol_short!("escrow"), &new);
+       env.storage().instance().set(&symbol_short!("version"), &2u32);
+   }
+   ```
+4. **Write a test** in `test.rs` that manually writes the old struct bytes into storage and asserts the migrated state is correct.
+5. **Gate `migrate` behind admin auth** before deploying to production (see security notes below).
+
+### Deployment upgrade flow
+
 ```
+1. Deploy new WASM (bump SCHEMA_VERSION, add migration arm)
+2. Call get_version()  ->  confirm stored version == N
+3. Call migrate(N)     ->  storage upgraded to N+1
+4. Call get_version()  ->  confirm stored version == N+1
+5. Resume normal operations
+```
+
+The contract rejects `migrate` calls that:
+- Pass a `from_version` that does not match the stored version (prevents accidental double-migration).
+- Pass a `from_version >= SCHEMA_VERSION` (already up to date).
+
+### Security notes
+
+- **Re-initialization guard** — `init` panics if the escrow is already initialized, preventing state overwrite.
+- **`migrate` must be admin-gated in production** — the current implementation is open for testability. Before mainnet deployment, add `admin_address.require_auth()` at the top of `migrate` so only the contract deployer can trigger upgrades.
+- **No silent data loss** — migration arms must explicitly handle every field. Defaulting a field to zero/false is intentional and must be documented in the version history table above.
+- **Immutable history** — old migration arms should never be removed; they ensure any instance at any historical version can be brought forward step-by-step.
 
 ---
 
-## CI/CD
+## Security & Authorization
 
-GitHub Actions runs on every push and pull request to `main`:
+Currently, the contract methods (`init`, `fund`, `settle`) **do not enforce authorization** via `require_auth()`. They rely solely on state-machine guards (e.g. checking if `status == 0` before funding).
 
+> **Warning:** This represents an authentication gap. Any caller can trigger these functions. Negative tests have been added to track this gap and ensure proper exceptions are thrown when the contract is in an invalid state.
+
+---
+
+
+## Funding Constraints
+- **Minimum Funding:** All funding amounts must be strictly greater than zero ($> 0$). 
+- **Initialization:** Escrow creation will fail if the target amount is not positive.
+- **Integer Safety:** Uses `checked_add` to prevent overflow during funded amount accounting.
+
+---
+
+## Security Assumptions
+
+- Soroban runtime guarantees:
+- Deterministic execution
+- Storage integrity
+- Token transfers handled externally
+- Off-chain systems validate invoice authenticity
+
+---
+
+---
+
+## Invariants
+
+- `funded_amount <= funding_target` (soft enforced)
+- `status transitions`: 0 → 1 → 2
+- Cannot settle before funded
 | Step | Command | Fails if… |
 |------|---------|-----------|
 | Format | `cargo fmt --all -- --check` | any file is not formatted |
@@ -172,15 +264,19 @@ Keep formatting, tests, and coverage passing before opening a PR.
 5. **Verify locally**:
    - `cargo fmt --all -- --check`
    - `cargo build`
-   - `cargo test`
+   - `cargo test --features testutils`
 6. **Commit** with clear messages (e.g. `feat(escrow): X`, `test(escrow): Y`).
 7. **Push** to your fork and open a **Pull Request** to `main`.
 8. Wait for CI and address review feedback.
 
-We welcome new contracts (e.g. settlement, tokenization helpers), tests, and docs that align with LiquiFact’s invoice financing flow.
+We welcome new contracts (e.g. settlement, tokenization helpers), tests, and docs that align with LiquiFact's invoice financing flow.
 
 ---
 
-## License
+## Future Improvements
 
-MIT (see root LiquiFact project for full license).
+- Multi-escrow support
+- Role-based access control
+- Token integration
+- Event emission
+- Formal verification
