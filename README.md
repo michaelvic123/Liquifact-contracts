@@ -280,3 +280,43 @@ We welcome new contracts (e.g. settlement, tokenization helpers), tests, and doc
 - Token integration
 - Event emission
 - Formal verification
+
+## Emergency Refund Mechanism
+
+Emergency mode provides a safe pathway to return funds to investors when normal settlement cannot proceed (e.g., legal dispute, operational failure, or suspected fraud). It follows the same access control, naming, and state-machine patterns as the rest of the contract.
+
+### When It Can Be Activated
+- Escrow status is open (0) or funded (1).
+- Not available after settlement (2).
+- One-way transition: once activated, the escrow remains in emergency mode.
+
+### Who Can Activate
+- Admin only. The stored admin address must authorize the call. This mirrors the access control pattern used in update_maturity.
+
+### How Refunds Are Calculated
+- Each investor receives a refund equal to their recorded contribution balance.
+- Balances are tracked per investor during fund() in instance storage.
+- This is equivalent to a proportional distribution because the total of all investor balances equals the funded amount at the time of activation.
+
+### How Investors Claim
+1. Wait for the admin to activate emergency mode.
+2. Call emergency_refund(investor) with your address as the caller.
+3. The contract verifies:
+   - Emergency mode is active.
+   - You are authorized as the investor (require_auth).
+   - You have not already claimed.
+   - Your recorded balance is greater than zero.
+4. Your individual refund amount is returned and an EmergencyRefunded event is emitted for audit/indexing.
+5. You can verify the claim state with is_refunded(address) or your tracked balance with get_investor_balance(address).
+
+### Security Considerations
+- Checks–Effects–Interactions:
+  - Checks: validate emergency mode, investor auth, not-refunded, and non-zero balance.
+  - Effects: mark the investor as refunded and update escrow accounting before any external interaction.
+  - Interactions: emit EmergencyRefunded event last. In production integrations, token transfers should also occur last.
+- Double-claim prevention:
+  - A RefundedInvestors map marks claimants so repeated calls are rejected.
+- Reentrancy protection:
+  - A simple storage-based guard prevents re-entrant execution of the refund flow and is cleared after each successful refund.
+- Authorization:
+  - activate_emergency requires admin authorization; emergency_refund requires the investor’s authorization.
