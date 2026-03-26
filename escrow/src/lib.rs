@@ -392,8 +392,8 @@ impl LiquifactEscrow {
     /// Mark escrow as settled (buyer paid). Releases principal + yield to investors.
     ///
     /// This is the final step in the escrow lifecycle. It requires that:
-    /// 1. The escrow is fully funded (status = 1).
-    /// 2. The buyer has explicitly confirmed payment via `confirm_payment`.
+    /// 1. The escrow is fully funded (status = 1) or partially settled (status = 2).
+    /// 2. The settlement amount is positive.
     /// 3. The SME (payee) authorizes the settlement.
     ///
     /// # Authorization
@@ -402,13 +402,16 @@ impl LiquifactEscrow {
     /// preventing unauthorized state transitions to the settled state.
     ///
     /// # Panics
-    /// - If the escrow is not in the funded (status = 1) state.
-    /// - If the buyer has not confirmed the payment yet.
+    /// - If the settlement amount is not positive.
+    /// - If the escrow is not in the funded (status = 1) or partially settled (status = 2) state.
+    /// - If the cumulative settled amount would exceed total due (principal + interest).
     pub fn settle(env: Env, amount: i128) -> InvoiceEscrow {
         let mut escrow = Self::get_escrow(env.clone());
 
         // Auth boundary: only the SME (payee) may settle the escrow.
         escrow.sme_address.require_auth();
+
+        assert!(amount > 0, "Settlement amount must be positive");
 
         assert!(
             escrow.status == 1 || escrow.status == 2,
