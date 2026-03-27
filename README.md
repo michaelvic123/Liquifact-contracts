@@ -1,20 +1,16 @@
-# LiquiFact Escrow Contract – Threat Model & Security Notes
+# LiquiFact Escrow Contract
 
-Soroban smart contracts for **LiquiFact** — the global invoice liquidity network on Stellar.
-This repo contains the **escrow** contract that holds investor funds for tokenized invoices until settlement.
+Soroban smart contracts for **LiquiFact** on Stellar. This repository currently
+contains the `escrow` contract crate and its supporting documentation.
 
----
-
-## Threat Model
-
-### 1. Unauthorized Access
+## Storage Schema And Upgrade Compatibility
 
 **Risk:**
 - Unauthorized caller could attempt to `fund`, `confirm_payment`, `settle`, or `redeem`
 
-**Impact:**
-- Malicious settlement
-- Fake funding events
+- the raw storage inventory actually declared or referenced by source
+- the narrative schema view reviewers should rely on when evaluating upgrades
+- known divergences where code and documentation cannot yet be made perfectly clean
 
 **Mitigation (Current):**
 - Role-based authorization:
@@ -35,23 +31,21 @@ This repo contains the **escrow** contract that holds investor funds for tokeniz
 
 ---
 
-### 3. Replay / Double Execution
+- instance storage references currently use the literal keys `"escrow"` and `"version"`
+- the persisted escrow record is the `InvoiceEscrow` struct as declared in source
+- any API parameter or helper that is not written into storage is excluded from the
+  persisted schema narrative and called out separately as divergence
 
-```bash
-git clone <this-repo-url>
-cd liquifact-contracts
-cargo build
-cargo test
-```
+### Raw storage inventory
 
----
+#### Instance storage keys referenced by source
 
-### 5. Invalid Input / Economic Attacks
+| Key | Source usage | Stored value |
+|---|---|---|
+| `"escrow"` | `get_escrow`, `init`, `fund`, `settle`, `update_maturity`, `withdraw`, migration example | `InvoiceEscrow` |
+| `"version"` | `init`, `get_version`, `migrate` | `u32` schema version |
 
-**Risks:**
-- Negative funding
-- Zero funding
-- Invalid maturity
+#### Persisted struct fields exactly as declared in `InvoiceEscrow`
 
 | Command                    | Description                   |
 |----------------------------|-------------------------------|
@@ -60,41 +54,31 @@ cargo test
 | `cargo fmt`                | Format code                   |
 | `cargo fmt -- --check`     | Check formatting (used in CI) |
 
----
+### Narrative schema view
 
-### 6. Time-based Attacks
+The contract is trying to persist a single escrow snapshot plus an explicit
+schema version:
 
-```text
-liquifact-contracts/
-├── Cargo.toml              # Workspace definition
-├── docs/
-│   └── EVENT_SCHEMA.md    # Indexer-friendly event schema reference
-├── escrow/
-│   ├── Cargo.toml          # Escrow contract crate
-│   └── src/
-│       ├── lib.rs       # LiquiFact escrow contract (init, fund, settle, migrate)
-│       └── test.rs      # Unit tests
-├── docs/
-│   ├── openapi.yaml     # OpenAPI 3.1 specification
-│   ├── package.json     # Test runner deps (AJV, js-yaml)
-│   └── tests/
-│       └── openapi.test.js  # Schema conformance tests (51 cases)
-└── .github/workflows/
-    └── ci.yml              # CI: fmt, build, test
-```
+- `"escrow"` stores the full invoice escrow snapshot
+- `"version"` stores the current schema version independently for upgrade checks
 
-Records an investor contribution. Transitions to `status = 1` when
-`funded_amount >= funding_target`.
+For reviewer guidance, the intended persisted escrow fields are:
 
-> **Production note:** Must be called atomically with a SEP-41 token `transfer`
-> from `investor` to the contract address. This version records accounting only.
+| Field | Intended meaning |
+|---|---|
+| `invoice_id` | Short invoice identifier used as part of the escrow record |
+| `admin` | Administrative address intended to control privileged maintenance actions |
+| `sme_address` | SME beneficiary address |
+| `amount` | Principal amount |
+| `funding_target` | Funding threshold, currently initialized from `amount` |
+| `funded_amount` | Running funded total |
+| `settled_amount` | Running settled total; source support exists but behavior is still inconsistent |
+| `yield_bps` | Yield in basis points |
+| `maturity` | Maturity timestamp |
+| `status` | Lifecycle state flag |
+| `version` | Persisted schema version, expected to track `SCHEMA_VERSION` |
 
-**Parameters**
-
-| Parameter   | Constraints                                  |
-|-------------|----------------------------------------------|
-| `_investor` | Investor's Stellar address (for audit trail) |
-| `amount`    | > 0 recommended; partial funding is allowed  |
+### Status values
 
 - **init** — Create an invoice escrow (invoice id, SME address, amount, yield bps, maturity). Emits `init` event.
 - **get_escrow** — Read current escrow state.
@@ -140,7 +124,10 @@ All payload types (`InitEvent`, `FundEvent`, `SettleEvent`) are exported `#[cont
 
 The `invoice_id` in the topic allows indexers to filter events by invoice without decoding the payload.
 
-## Security & Authorization
+- Re-initialization protection is intended, but the current guard references undefined helper machinery.
+- Upgrade paths should be admin-gated before production deployment.
+- Migration code must never silently drop or reinterpret historical fields.
+- Reviewers should treat source drift as a signal to preserve backward decoders and add focused migration tests before any schema evolution lands.
 
 State-changing methods enforce Stellar auth using `require_auth()`:
 - `fund` requires authorization from the caller (the `investor`).
@@ -183,19 +170,15 @@ Read-only methods (including `get_investor_position`) do not require auth, and r
 | Format | `cargo fmt --all -- --check` | any file is not formatted |
 | Build | `cargo build` | compilation error |
 | Tests | `cargo test` | any test fails |
-| Coverage | `cargo llvm-cov --features testutils --fail-under-lines 95` | line coverage < 95 % |
+| Coverage | `cargo llvm-cov --features testutils --fail-under-lines 95` | line coverage < 95% |
 
 ### Coverage gate
 
-The pipeline uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (installed via `taiki-e/install-action`) to measure line coverage and hard-fail the job when it drops below **95 %**.
-
-To run the coverage check locally:
+The pipeline uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+to measure line coverage and fail when it drops below **95%**.
 
 ```bash
-# Install once
 cargo install cargo-llvm-cov
-
-# Run (requires llvm-tools-preview component)
 rustup component add llvm-tools-preview
 cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only
 ```
