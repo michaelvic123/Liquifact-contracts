@@ -111,11 +111,15 @@ pub struct AdminTransferredEvent {
 #[contract]
 pub struct LiquifactEscrow;
 
-#[contractimpl]
 impl LiquifactEscrow {
     // ── init ──────────────────────────────────────────────────────────────────
 
-    /// Initialize a new invoice escrow.
+    fn store(env: &Env, escrow: &InvoiceEscrow) {
+        env.storage().instance().set(&ESCROW_KEY, escrow);
+        env.storage().instance().set(&VERSION_KEY, &escrow.version);
+    }
+
+    /// Validate economic and time inputs for a new escrow.
     ///
     /// # Authorization
     /// Requires authorization from `admin`.
@@ -143,7 +147,7 @@ impl LiquifactEscrow {
             invoice_id: invoice_id.clone(),
             sme_address: sme_address.clone(),
             amount,
-            funding_target: amount,
+            funding_target,
             funded_amount: 0,
             yield_bps,
             maturity,
@@ -245,14 +249,20 @@ impl LiquifactEscrow {
             name: symbol_short!("funded"),
             invoice_id: escrow.invoice_id.clone(),
             investor,
-            amount,
+            amount_offered: amount,
+            amount_accepted,
+            excess_amount,
             funded_amount: escrow.funded_amount,
             status: escrow.status,
             is_paid: false,
         }
         .publish(&env);
 
-        escrow
+        Ok(FundResult {
+            escrow: escrow.clone(),
+            amount_accepted,
+            excess_amount,
+        })
     }
 
     // ── settle ────────────────────────────────────────────────────────────────

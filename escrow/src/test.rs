@@ -32,7 +32,10 @@ fn setup_escrow(_env: &Env, client: &LiquifactEscrowClient, admin: &Address, sme
     );
 }
 
-// ── init ──────────────────────────────────────────────────────────────────────
+/// Ledger "now" used for valid maturities in tests.
+fn t0(env: &Env) -> u64 {
+    env.ledger().timestamp()
+}
 
 #[test]
 fn test_init_stores_escrow() {
@@ -83,7 +86,7 @@ fn test_init_requires_admin_auth() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("INV001"),
+        &symbol_short!("INVB"),
         &sme,
         &10_000_0000000i128,
         &800i64,
@@ -141,7 +144,7 @@ fn test_fund_and_settle() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV002"),
+        &symbol_short!("INVMETA"),
         &sme,
         &10_000_0000000i128,
         &800i64,

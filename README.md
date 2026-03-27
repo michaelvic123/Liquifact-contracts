@@ -24,7 +24,7 @@ contains the `escrow` contract crate and its supporting documentation.
 
 ---
 
-### 2. Arithmetic Risks (Overflow / Underflow)
+## Initialization validation
 
 **Risk:**
 
@@ -166,7 +166,12 @@ Main methods:
 - `transfer_admin`
 - `migrate_singleton`
 
----
+| Command | Description |
+|---------|-------------|
+| `cargo build` | Build the contract |
+| `cargo test` | Tests (with `testutils` where needed) |
+| `cargo fmt --all -- --check` | CI formatting |
+| `cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only` | Coverage gate (matches CI) |
 
 ---
 
