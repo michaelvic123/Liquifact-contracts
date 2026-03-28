@@ -15,13 +15,46 @@
 //! embed a timelock or council multisig: production deployments should treat `admin` as a
 //! governed contract or multisig so holds cannot be used for indefinite fund lock **without**
 //! off-chain governance recovery (rotation, vote, emergency procedures).
+//!
+//! ## Invoice identifier (`invoice_id`)
+//!
+//! At initialization, `invoice_id` is supplied as a Soroban [`String`] and validated for length
+//! and charset before conversion to [`Symbol`] for storage. Align off-chain invoice slugs with the
+//! same rules (ASCII alphanumeric + `_`, max length [`MAX_INVOICE_ID_STRING_LEN`]) so indexers stay
+//! unambiguous.
+//!
+//! ## Funding token and registry (immutable hints)
+//!
+//! Each escrow instance binds exactly one **funding token** contract ([`DataKey::FundingToken`])
+//! at [`LiquifactEscrow::init`]; it cannot be changed after deploy. An optional **registry**
+//! ([`DataKey::RegistryRef`]) is a read-only discoverability hint only — it is **not** an authority
+//! for this contract and must not be used on-chain as proof of registry state without calling the
+//! registry yourself.
+//!
+//! ## Terminal dust sweep
+//!
+//! [`LiquifactEscrow::sweep_terminal_dust`] moves at most [`MAX_DUST_SWEEP_AMOUNT`] units of the
+//! bound funding token from this contract to the immutable **treasury** address, only when the
+//! escrow has reached a **terminal** [`InvoiceEscrow::status`] (settled or withdrawn). It cannot run
+//! during a legal hold. This is meant for rounding residue / stray transfers, not for settling
+//! live liabilities — integrations that custody principal on-chain must keep token balances
+//! reconciled with `funded_amount` so treasury sweeps cannot pull user funds.
 
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+    contract, contractevent, contractimpl, contracttype, symbol_short, token::TokenClient, Address,
+    Env, MuxedAddress, String, Symbol,
 };
 
 /// Current storage schema version (`DataKey::Version`).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// Upper bound on [`LiquifactEscrow::sweep_terminal_dust`] per call (base units of the funding token).
+///
+/// Caps blast radius if instrumentation mis-estimates “dust”; tune per asset decimals off-chain.
+pub const MAX_DUST_SWEEP_AMOUNT: i128 = 100_000_000;
+
+/// Maximum UTF-8 byte length for the invoice `String` at init (matches Soroban [`Symbol`] max).
+pub const MAX_INVOICE_ID_STRING_LEN: u32 = 32;
 
 // --- Storage keys ---
 
@@ -38,6 +71,13 @@ pub enum DataKey {
     SmeCollateralPledge,
     /// Set when an investor has exercised a claim after settlement.
     InvestorClaimed(Address),
+    /// SEP-41 funding asset for this invoice instance; set once in [`LiquifactEscrow::init`].
+    FundingToken,
+    /// Protocol treasury that may receive [`LiquifactEscrow::sweep_terminal_dust`]; set once in init.
+    Treasury,
+    /// Optional registry contract id for indexers; **hint only**, not authority (see module rustdoc).
+    /// Omitted from storage when unset at init.
+    RegistryRef,
 }
 
 // --- Data types ---
@@ -162,8 +202,40 @@ pub struct InvestorPayoutClaimed {
     pub investor: Address,
 }
 
+#[contractevent]
+pub struct TreasuryDustSwept {
+    #[topic]
+    pub name: Symbol,
+    pub invoice_id: Symbol,
+    pub token: Address,
+    pub amount: i128,
+}
+
 #[contract]
 pub struct LiquifactEscrow;
+
+fn validate_invoice_id_string(env: &Env, invoice_id: &String) -> Symbol {
+    let len = invoice_id.len();
+    assert!(
+        len >= 1 && len <= MAX_INVOICE_ID_STRING_LEN,
+        "invoice_id length must be 1..=MAX_INVOICE_ID_STRING_LEN"
+    );
+    let len_u = len as usize;
+    let mut buf = [0u8; 32];
+    invoice_id.copy_into_slice(&mut buf[..len_u]);
+    for &b in &buf[..len_u] {
+        let ok = (b >= b'A' && b <= b'Z')
+            || (b >= b'a' && b <= b'z')
+            || (b >= b'0' && b <= b'9')
+            || b == b'_';
+        assert!(
+            ok,
+            "invoice_id must be [A-Za-z0-9_] only (Soroban Symbol charset subset)"
+        );
+    }
+    let s = core::str::from_utf8(&buf[..len_u]).expect("invoice_id ascii");
+    Symbol::new(env, s)
+}
 
 #[contractimpl]
 impl LiquifactEscrow {
@@ -176,16 +248,27 @@ impl LiquifactEscrow {
 
     /// Initialize escrow. `funding_target` defaults to `amount`.
     ///
+    /// Binds **`funding_token`**, **`treasury`**, and optional **`registry`** for this instance only.
+    /// The funding token and treasury addresses are **immutable** after this call; the registry id is
+    /// optional metadata for off-chain indexers (not an on-chain authority).
+    ///
+    /// `invoice_id` must satisfy [`MAX_INVOICE_ID_STRING_LEN`] and charset rules (see
+    /// [`validate_invoice_id_string`]).
+    ///
     /// # Panics
-    /// If `amount` or implied target is not positive, `yield_bps > 10_000`, or escrow exists.
+    /// If `amount` or implied target is not positive, `yield_bps > 10_000`, invoice id invalid,
+    /// or escrow exists.
     pub fn init(
         env: Env,
         admin: Address,
-        invoice_id: Symbol,
+        invoice_id: String,
         sme_address: Address,
         amount: i128,
         yield_bps: i64,
         maturity: u64,
+        funding_token: Address,
+        registry: Option<Address>,
+        treasury: Address,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -199,8 +282,10 @@ impl LiquifactEscrow {
             "Escrow already initialized"
         );
 
+        let invoice_sym = validate_invoice_id_string(&env, &invoice_id);
+
         let escrow = InvoiceEscrow {
-            invoice_id: invoice_id.clone(),
+            invoice_id: invoice_sym.clone(),
             admin: admin.clone(),
             sme_address: sme_address.clone(),
             amount,
@@ -215,6 +300,13 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .set(&DataKey::Version, &SCHEMA_VERSION);
+        env.storage()
+            .instance()
+            .set(&DataKey::FundingToken, &funding_token);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        if let Some(ref r) = registry {
+            env.storage().instance().set(&DataKey::RegistryRef, r);
+        }
 
         EscrowInitialized {
             name: symbol_short!("escrow_ii"),
@@ -223,6 +315,89 @@ impl LiquifactEscrow {
         .publish(&env);
 
         escrow
+    }
+
+    /// Bound funding token (immutable after [`LiquifactEscrow::init`]).
+    pub fn get_funding_token(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::FundingToken)
+            .unwrap_or_else(|| panic!("Funding token not set"))
+    }
+
+    /// Treasury that may receive terminal dust sweeps (immutable after init).
+    pub fn get_treasury(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .unwrap_or_else(|| panic!("Treasury not set"))
+    }
+
+    /// Optional registry contract id (**hint only** — not authority for this escrow).
+    pub fn get_registry_ref(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::RegistryRef)
+    }
+
+    /// Move up to `amount` (capped by balance and [`MAX_DUST_SWEEP_AMOUNT`]) of the **funding token**
+    /// from this contract to [`DataKey::Treasury`].
+    ///
+    /// # Terminal state requirement
+    /// Only permitted when [`InvoiceEscrow::status`] is **2 (settled)** or **3 (withdrawn)**.
+    /// Open (0) or funded (1) states reject the call so live principal cannot be swept as dust.
+    ///
+    /// # Authorization
+    /// The configured **treasury** account must authorize this call; the admin cannot sweep unless
+    /// it is also the treasury.
+    ///
+    /// Blocked while [`DataKey::LegalHold`] is active.
+    pub fn sweep_terminal_dust(env: Env, amount: i128) -> i128 {
+        assert!(
+            !Self::legal_hold_active(&env),
+            "Legal hold blocks treasury dust sweep"
+        );
+        assert!(amount > 0, "sweep amount must be positive");
+        assert!(
+            amount <= MAX_DUST_SWEEP_AMOUNT,
+            "sweep amount exceeds MAX_DUST_SWEEP_AMOUNT"
+        );
+
+        let escrow = Self::get_escrow(env.clone());
+        assert!(
+            escrow.status == 2 || escrow.status == 3,
+            "dust sweep only in terminal states (settled or withdrawn)"
+        );
+
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .expect("treasury must be initialized");
+        treasury.require_auth();
+
+        let token_addr = env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingToken)
+            .expect("funding token must be initialized");
+        let this = env.current_contract_address();
+
+        let token = TokenClient::new(&env, &token_addr);
+        let balance = token.balance(&this);
+        assert!(balance > 0, "no funding token balance to sweep");
+        let sweep_amt = amount.min(balance);
+        assert!(sweep_amt > 0, "effective sweep amount is zero");
+
+        token.transfer(&this, &MuxedAddress::from(treasury.clone()), &sweep_amt);
+
+        TreasuryDustSwept {
+            name: symbol_short!("dust_sw"),
+            invoice_id: escrow.invoice_id.clone(),
+            token: token_addr,
+            amount: sweep_amt,
+        }
+        .publish(&env);
+
+        sweep_amt
     }
 
     pub fn get_escrow(env: Env) -> InvoiceEscrow {

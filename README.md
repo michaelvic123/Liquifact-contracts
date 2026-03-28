@@ -6,20 +6,35 @@ Soroban smart contracts for **LiquiFact** on Stellar. This repository contains t
 
 | Method | Purpose |
 |--------|---------|
-| `init` | Create escrow (admin auth). Sets `funding_target = amount`. |
+| `init` | Create escrow (admin auth). Sets `funding_target = amount`. Binds **`funding_token`**, **`treasury`**, optional **`registry`**; validates **`invoice_id`** string (length ≤ 32, charset `[A-Za-z0-9_]`). |
 | `get_escrow` / `get_version` / `get_legal_hold` | Read state. |
+| `get_funding_token` / `get_treasury` / `get_registry_ref` | Immutable funding asset, treasury for dust recovery, optional registry hint (`None` if unset at init). |
 | `get_contribution` | Per-investor funded principal. |
 | `update_funding_target` | Admin, open state only; target ≥ `funded_amount`. |
 | `fund` | Investor auth; blocked while legal hold is active. |
 | `withdraw` | SME auth; funded → withdrawn; blocked under legal hold. |
 | `settle` | SME auth; funded → settled (maturity gate if set); blocked under legal hold. |
 | `claim_investor_payout` | Investor auth; after settle; blocked under legal hold. |
+| `sweep_terminal_dust` | **Treasury auth only**; transfers capped [`MAX_DUST_SWEEP_AMOUNT`] of the bound token after **terminal** status (settled or withdrawn); blocked under legal hold. |
 | `record_sme_collateral_commitment` | SME auth; **record-only** pledge (asset + amount + timestamp). |
 | `get_sme_collateral_commitment` / `is_investor_claimed` | Reads. |
 | `set_legal_hold` / `clear_legal_hold` | Admin governance (hold blocks risk-bearing transitions). |
 | `update_maturity` | Admin, open state only. |
 | `transfer_admin` | Admin rotation. |
 | `migrate` | Version guardrails (see upgrade policy below). |
+
+### Per-instance funding asset and registry (issues #113, #116)
+
+- **`funding_token`** and **`treasury`** are stored under `DataKey::FundingToken` / `DataKey::Treasury` and are **immutable** after `init` (no setter).
+- **`registry`** is optional: when provided, it is stored under `DataKey::RegistryRef`; if omitted, that key is absent and `get_registry_ref` returns `None`. The registry id is a **read-only hint for indexers** — it does **not** grant this escrow any privilege and must not be treated as an on-chain source of truth without calling the registry contract directly (avoid static “call loops” that assume mutual authority).
+
+### Invoice id validation (issue #118)
+
+Off-chain invoice slugs should match the same rules enforced in `init`: non-empty, length ≤ 32 (Soroban `Symbol` maximum), characters in `[A-Za-z0-9_]` only (SEP-style slugs; no spaces, punctuation, or Unicode).
+
+### Treasury dust sweep (issue #107)
+
+`sweep_terminal_dust(amount)` moves `min(amount, balance, MAX_DUST_SWEEP_AMOUNT)` of the **bound** funding token from the escrow contract to **`treasury`**. It is only callable in **status 2 (settled)** or **status 3 (withdrawn)** so **open** or **funded** escrows cannot be drained as “dust.” Legal hold blocks sweeps. **`fund` does not move tokens** in this version; if custodial flows are added later, token balances must stay reconciled with ledger fields so sweeps cannot pull user principal. Tokens sent to this contract in **other** assets are not touched by this hook.
 
 ### Optional SME collateral (record-only)
 
@@ -31,7 +46,7 @@ When `DataKey::LegalHold` is true, the contract rejects new `fund`, `settle`, SM
 
 ### Storage keys (`DataKey`)
 
-Public enum in [`escrow/src/lib.rs`](escrow/src/lib.rs): `Escrow`, `Version`, `InvestorContribution(Address)`, `LegalHold`, `SmeCollateralPledge`, `InvestorClaimed(Address)`. New optional keys should keep **additive** names and avoid reusing or repurposing existing variants.
+Public enum in [`escrow/src/lib.rs`](escrow/src/lib.rs): `Escrow`, `Version`, `InvestorContribution(Address)`, `LegalHold`, `SmeCollateralPledge`, `InvestorClaimed(Address)`, `FundingToken`, `Treasury`, `RegistryRef` (present only when set at init). New optional keys should keep **additive** names and avoid reusing or repurposing existing variants.
 
 ---
 
@@ -96,7 +111,7 @@ stellar contract deploy \
 # Record emitted contract id as LIQUIFACT_ESCROW_CONTRACT_ID
 ```
 
-Initialize on-chain with `init` via `stellar contract invoke` (pass `admin`, `invoice_id`, `sme_address`, amounts, `yield_bps`, `maturity` per your product).
+Initialize on-chain with `init` via `stellar contract invoke` (pass `admin`, **`invoice_id` as string**, `sme_address`, amounts, `yield_bps`, `maturity`, **`funding_token`**, **`registry`** as optional address, **`treasury`** per your product).
 
 ### Verify artifact hash
 
@@ -133,10 +148,12 @@ rustup component add llvm-tools-preview
 
 ## Security notes
 
-- **Auth:** state-changing entrypoints use `require_auth()` for the appropriate role (admin, SME, investor).
+- **Auth:** state-changing entrypoints use `require_auth()` for the appropriate role (admin, SME, investor, **treasury** for dust sweep).
 - **Legal hold:** is governance-controlled; misuse risk is mitigated by using a multisig `admin` and operational policy.
 - **Collateral record:** is not proof of encumbrance until a future version explicitly enforces token transfers.
 - **Overflow:** `fund` uses `checked_add` on `funded_amount`.
+- **Dust sweep:** gated on **terminal** escrow status, per-call **cap** ([`MAX_DUST_SWEEP_AMOUNT`]), actual **balance**, **legal hold**, and **treasury** auth; only the **configured** SEP-41 token is transferred. Wrong-asset or oversized balances still require operational discipline — the hook is not a general-purpose withdrawal for live liabilities.
+- **Registry ref:** stored for discoverability only; it must not be used as an authority without verifying behavior of the registry contract off-chain or in a dedicated integration.
 
 ---
 

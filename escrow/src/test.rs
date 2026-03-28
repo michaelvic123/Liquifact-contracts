@@ -1,8 +1,9 @@
-use super::{LiquifactEscrow, LiquifactEscrowClient, SCHEMA_VERSION};
+use super::{LiquifactEscrow, LiquifactEscrowClient, MAX_DUST_SWEEP_AMOUNT, SCHEMA_VERSION};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger as _},
-    Address, Env,
+    token::StellarAssetClient,
+    Address, Env, String,
 };
 
 fn deploy(env: &Env) -> LiquifactEscrowClient<'_> {
@@ -18,14 +19,22 @@ fn setup(env: &Env) -> (LiquifactEscrowClient<'_>, Address, Address) {
     (client, admin, sme)
 }
 
-fn default_init(client: &LiquifactEscrowClient<'_>, admin: &Address, sme: &Address) {
+fn free_addresses(env: &Env) -> (Address, Address) {
+    (Address::generate(env), Address::generate(env))
+}
+
+fn default_init(client: &LiquifactEscrowClient<'_>, env: &Env, admin: &Address, sme: &Address) {
+    let (token, treasury) = free_addresses(env);
     client.init(
         admin,
-        &symbol_short!("INV001"),
+        &String::from_str(env, "INV001"),
         sme,
         &10_000_0000000i128,
         &800i64,
         &1000u64,
+        &token,
+        &None,
+        &treasury,
     );
 }
 
@@ -37,11 +46,14 @@ fn test_init_stores_escrow() {
     let (client, admin, sme) = setup(&env);
     let escrow = client.init(
         &admin,
-        &symbol_short!("INV001"),
+        &String::from_str(&env, "INV001"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     assert_eq!(escrow.invoice_id, symbol_short!("INV001"));
     assert_eq!(escrow.admin, admin);
@@ -60,11 +72,14 @@ fn test_init_stores_keyed_invoice_and_lists_it() {
     let (client, admin, sme) = setup(&env);
     let escrow = client.init(
         &admin,
-        &symbol_short!("INV001"),
+        &String::from_str(&env, "INV001"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     let got = client.get_escrow();
     assert_eq!(got.invoice_id, escrow.invoice_id);
@@ -80,11 +95,14 @@ fn test_init_requires_admin_auth() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("INVB"),
+        &String::from_str(&env, "INVB"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     assert!(
         env.auths().iter().any(|(addr, _)| *addr == admin),
@@ -101,11 +119,14 @@ fn test_init_unauthorized_panics() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.init(
             &admin,
-            &symbol_short!("INV001"),
+            &String::from_str(&env, "INV001"),
             &sme,
             &1_000i128,
             &800i64,
             &1000u64,
+            &Address::generate(&env),
+            &None,
+            &Address::generate(&env),
         );
     }));
     assert!(result.is_err(), "Expected panic without auth");
@@ -116,8 +137,8 @@ fn test_init_unauthorized_panics() {
 fn test_double_init_panics() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
-    default_init(&client, &admin, &sme);
-    default_init(&client, &admin, &sme);
+    default_init(&client, &env, &admin, &sme);
+    default_init(&client, &env, &admin, &sme);
 }
 
 #[test]
@@ -137,11 +158,14 @@ fn test_fund_and_settle() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INVMETA"),
+        &String::from_str(&env, "INVMETA"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     let funded = client.fund(&investor, &TARGET);
     assert_eq!(funded.funded_amount, TARGET);
@@ -157,11 +181,14 @@ fn test_fund_partial_then_full() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV002"),
+        &String::from_str(&env, "INV002"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     let partial = client.fund(&investor, &(TARGET / 2));
     assert_eq!(partial.status, 0);
@@ -177,7 +204,7 @@ fn test_fund_zero_amount_panics() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     let investor = Address::generate(&env);
-    default_init(&client, &admin, &sme);
+    default_init(&client, &env, &admin, &sme);
     client.fund(&investor, &0i128);
 }
 
@@ -187,7 +214,7 @@ fn test_fund_after_funded_panics() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     let investor = Address::generate(&env);
-    default_init(&client, &admin, &sme);
+    default_init(&client, &env, &admin, &sme);
     client.fund(&investor, &TARGET);
     client.fund(&investor, &1i128);
 }
@@ -197,7 +224,7 @@ fn test_fund_requires_investor_auth() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
     let investor = Address::generate(&env);
-    default_init(&client, &admin, &sme);
+    default_init(&client, &env, &admin, &sme);
     client.fund(&investor, &TARGET);
     assert!(
         env.auths().iter().any(|(addr, _)| *addr == investor),
@@ -212,11 +239,14 @@ fn test_single_investor_contribution_tracked() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV020"),
+        &String::from_str(&env, "INV020"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &(3_000_0000000i128));
     let contribution = client.get_contribution(&investor);
@@ -229,7 +259,7 @@ fn test_unknown_investor_contribution_is_zero() {
     let (client, admin, sme) = setup(&env);
     let investor = Address::generate(&env);
     let stranger = Address::generate(&env);
-    default_init(&client, &admin, &sme);
+    default_init(&client, &env, &admin, &sme);
     client.fund(&investor, &1_000i128);
     assert_eq!(client.get_contribution(&stranger), 0i128);
 }
@@ -241,11 +271,14 @@ fn test_repeated_funding_accumulates_contribution() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV021"),
+        &String::from_str(&env, "INV021"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &(2_000_0000000i128));
     client.fund(&investor, &(3_000_0000000i128));
@@ -261,11 +294,14 @@ fn test_multiple_investors_tracked_independently() {
     let inv_c = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV023"),
+        &String::from_str(&env, "INV023"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&inv_a, &(2_000_0000000i128));
     client.fund(&inv_b, &(5_000_0000000i128));
@@ -288,11 +324,14 @@ fn test_contributions_sum_equals_funded_amount() {
     let inv_c = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV023b"),
+        &String::from_str(&env, "INV023b"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&inv_a, &(2_000_0000000i128));
     client.fund(&inv_b, &(5_000_0000000i128));
@@ -312,11 +351,14 @@ fn test_settle_after_full_funding() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV003"),
+        &String::from_str(&env, "INV003"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &TARGET);
     let settled = client.settle();
@@ -330,11 +372,14 @@ fn test_settle_before_funded_panics() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("INV011"),
+        &String::from_str(&env, "INV011"),
         &sme,
         &1_000i128,
         &500i64,
         &2000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.settle();
 }
@@ -346,11 +391,14 @@ fn test_settle_requires_sme_auth() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV006"),
+        &String::from_str(&env, "INV006"),
         &sme,
         &1_000i128,
         &500i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     client.settle();
@@ -371,11 +419,14 @@ fn test_settle_unauthorized_panics() {
     let client = deploy(&env);
     client.init(
         &admin,
-        &symbol_short!("INV008"),
+        &String::from_str(&env, "INV008"),
         &sme,
         &1_000i128,
         &500i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     env.mock_auths(&[]);
@@ -390,11 +441,14 @@ fn test_settle_before_maturity_panics() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV032"),
+        &String::from_str(&env, "INV032"),
         &sme,
         &1_000i128,
         &500i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     client.settle();
@@ -407,11 +461,14 @@ fn test_settle_after_maturity_succeeds() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV033"),
+        &String::from_str(&env, "INV033"),
         &sme,
         &1_000i128,
         &500i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     env.ledger().set_timestamp(1001);
@@ -426,11 +483,14 @@ fn test_settle_at_exact_maturity_succeeds() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV034"),
+        &String::from_str(&env, "INV034"),
         &sme,
         &1_000i128,
         &500i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     env.ledger().set_timestamp(1000);
@@ -445,11 +505,14 @@ fn test_settle_with_zero_maturity_succeeds_immediately() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV035"),
+        &String::from_str(&env, "INV035"),
         &sme,
         &1_000i128,
         &500i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     let settled = client.settle();
@@ -463,11 +526,14 @@ fn test_settle_at_timestamp_zero_before_maturity_panics() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV036"),
+        &String::from_str(&env, "INV036"),
         &sme,
         &1_000i128,
         &500i64,
         &500u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -487,11 +553,14 @@ fn test_update_maturity_success() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("INV006b"),
+        &String::from_str(&env, "INV006b"),
         &sme,
         &1_000i128,
         &500i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     let updated = client.update_maturity(&2000u64);
     assert_eq!(updated.maturity, 2000u64);
@@ -506,11 +575,14 @@ fn test_update_maturity_wrong_state() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV007"),
+        &String::from_str(&env, "INV007"),
         &sme,
         &1_000i128,
         &500i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     client.update_maturity(&2000u64);
@@ -526,11 +598,14 @@ fn test_update_maturity_unauthorized() {
     let client = deploy(&env);
     client.init(
         &admin,
-        &symbol_short!("INV009"),
+        &String::from_str(&env, "INV009"),
         &sme,
         &1_000i128,
         &500i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     env.mock_auths(&[]);
     client.update_maturity(&2000u64);
@@ -545,11 +620,14 @@ fn test_transfer_admin_updates_admin() {
     let new_admin = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("T001"),
+        &String::from_str(&env, "T001"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     let updated = client.transfer_admin(&new_admin);
     assert_eq!(updated.admin, new_admin);
@@ -563,11 +641,14 @@ fn test_transfer_admin_same_address_panics() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("T002"),
+        &String::from_str(&env, "T002"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.transfer_admin(&admin);
 }
@@ -589,7 +670,7 @@ fn test_transfer_admin_uninitialized_panics() {
 fn test_migrate_at_current_version_panics() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
-    default_init(&client, &admin, &sme);
+    default_init(&client, &env, &admin, &sme);
     client.migrate(&SCHEMA_VERSION);
 }
 
@@ -598,7 +679,7 @@ fn test_migrate_at_current_version_panics() {
 fn test_migrate_wrong_from_version_panics() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
-    default_init(&client, &admin, &sme);
+    default_init(&client, &env, &admin, &sme);
     client.migrate(&99u32);
 }
 
@@ -620,11 +701,14 @@ fn test_record_collateral_stored_and_does_not_block_settle() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("COL001"),
+        &String::from_str(&env, "COL001"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     let c = client.record_sme_collateral_commitment(&symbol_short!("USDC"), &5000i128);
     assert_eq!(c.amount, 5000i128);
@@ -643,11 +727,14 @@ fn test_collateral_zero_panics() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("COL002"),
+        &String::from_str(&env, "COL002"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.record_sme_collateral_commitment(&symbol_short!("XLM"), &0i128);
 }
@@ -659,11 +746,14 @@ fn test_collateral_requires_sme_auth() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("COL003"),
+        &String::from_str(&env, "COL003"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     env.mock_auths(&[]);
     client.record_sme_collateral_commitment(&symbol_short!("XLM"), &100i128);
@@ -678,11 +768,14 @@ fn test_legal_hold_blocks_settle_withdraw_claim_and_fund() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("LH001"),
+        &String::from_str(&env, "LH001"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &TARGET);
     client.set_legal_hold(&true);
@@ -722,11 +815,14 @@ fn test_legal_hold_blocks_new_funds_when_open() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("LH002"),
+        &String::from_str(&env, "LH002"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.set_legal_hold(&true);
     client.fund(&investor, &1i128);
@@ -739,11 +835,14 @@ fn test_withdraw_funded_then_cannot_settle() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("WD001"),
+        &String::from_str(&env, "WD001"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &TARGET);
     let wd = client.withdraw();
@@ -762,11 +861,14 @@ fn test_claim_investor_twice_panics() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("CL001"),
+        &String::from_str(&env, "CL001"),
         &sme,
         &1_000i128,
         &400i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     client.settle();
@@ -782,11 +884,14 @@ fn test_claim_before_settle_panics() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("CL002"),
+        &String::from_str(&env, "CL002"),
         &sme,
         &1_000i128,
         &400i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &1_000i128);
     client.claim_investor_payout(&investor);
@@ -800,11 +905,14 @@ fn test_cost_baseline_init() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("INV100"),
+        &String::from_str(&env, "INV100"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
 }
 
@@ -814,11 +922,14 @@ fn test_cost_baseline_init_zero_maturity() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("INV101"),
+        &String::from_str(&env, "INV101"),
         &sme,
         &TARGET,
         &800i64,
         &0u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
 }
 
@@ -828,11 +939,14 @@ fn test_cost_baseline_init_max_amount() {
     let (client, admin, sme) = setup(&env);
     client.init(
         &admin,
-        &symbol_short!("INV102"),
+        &String::from_str(&env, "INV102"),
         &sme,
         &i128::MAX,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
 }
 
@@ -843,11 +957,14 @@ fn test_cost_baseline_fund_partial() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV103"),
+        &String::from_str(&env, "INV103"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &(1_000_0000000i128));
 }
@@ -859,11 +976,14 @@ fn test_cost_baseline_fund_full() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV104"),
+        &String::from_str(&env, "INV104"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &TARGET);
 }
@@ -875,11 +995,14 @@ fn test_cost_baseline_fund_overshoot() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV105"),
+        &String::from_str(&env, "INV105"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &(15_000_0000000i128));
     assert_eq!(client.get_escrow().status, 1);
@@ -892,11 +1015,14 @@ fn test_cost_baseline_fund_two_step_completion() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV106"),
+        &String::from_str(&env, "INV106"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &(TARGET / 2));
     client.fund(&investor, &(TARGET / 2));
@@ -910,11 +1036,14 @@ fn test_cost_baseline_settle() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV103b"),
+        &String::from_str(&env, "INV103b"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &TARGET);
     env.ledger().set_timestamp(1001);
@@ -929,16 +1058,387 @@ fn test_cost_baseline_full_lifecycle() {
     let investor = Address::generate(&env);
     client.init(
         &admin,
-        &symbol_short!("INV110"),
+        &String::from_str(&env, "INV110"),
         &sme,
         &TARGET,
         &800i64,
         &1000u64,
+        &Address::generate(&env),
+        &None,
+        &Address::generate(&env),
     );
     client.fund(&investor, &TARGET);
     env.ledger().set_timestamp(1000);
     let settled = client.settle();
     assert_eq!(settled.status, 2);
+}
+
+// --- invoice id validation (#118) ---
+
+#[test]
+#[should_panic(expected = "invoice_id length")]
+fn test_init_invoice_id_empty_string_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (t, tr) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, ""),
+        &sme,
+        &1000i128,
+        &500i64,
+        &0u64,
+        &t,
+        &None,
+        &tr,
+    );
+}
+
+#[test]
+#[should_panic(expected = "invoice_id must be [A-Za-z0-9_]")]
+fn test_init_invoice_id_whitespace_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (t, tr) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "INV BAD"),
+        &sme,
+        &1000i128,
+        &500i64,
+        &0u64,
+        &t,
+        &None,
+        &tr,
+    );
+}
+
+#[test]
+#[should_panic(expected = "invoice_id length")]
+fn test_init_invoice_id_too_long_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (t, tr) = free_addresses(&env);
+    // 33 bytes — exceeds Soroban Symbol / our max of 32.
+    let thirty_three = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456";
+    client.init(
+        &admin,
+        &String::from_str(&env, thirty_three),
+        &sme,
+        &1000i128,
+        &500i64,
+        &0u64,
+        &t,
+        &None,
+        &tr,
+    );
+}
+
+#[test]
+#[should_panic(expected = "invoice_id must be [A-Za-z0-9_]")]
+fn test_init_invoice_id_bad_charset_hyphen_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (t, tr) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "INV-DASH"),
+        &sme,
+        &1000i128,
+        &500i64,
+        &0u64,
+        &t,
+        &None,
+        &tr,
+    );
+}
+
+// --- registry & funding token getters (#113, #116) ---
+
+#[test]
+fn test_init_stores_registry_some_and_getters() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let reg = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "REG001"),
+        &sme,
+        &5000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &Some(reg.clone()),
+        &treasury,
+    );
+    assert_eq!(client.get_registry_ref(), Some(reg));
+    assert_eq!(client.get_funding_token(), token);
+    assert_eq!(client.get_treasury(), treasury);
+}
+
+#[test]
+fn test_init_registry_none_roundtrip() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "REG002"),
+        &sme,
+        &5000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+    );
+    assert_eq!(client.get_registry_ref(), None);
+}
+
+// --- treasury dust sweep (#107) ---
+
+#[test]
+fn test_sweep_terminal_dust_after_settle_transfers_to_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+    client.init(
+        &admin,
+        &String::from_str(&env, "SW001"),
+        &sme,
+        &1_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+    );
+    let investor = Address::generate(&env);
+    client.fund(&investor, &1_000i128);
+    client.settle();
+
+    let stellar = StellarAssetClient::new(&env, &token);
+    stellar.mint(&escrow_id, &5_000i128);
+    let before_t = stellar.balance(&treasury);
+    let swept = client.sweep_terminal_dust(&5_000i128);
+    assert_eq!(swept, 5_000i128);
+    assert_eq!(stellar.balance(&treasury), before_t + 5_000i128);
+}
+
+#[test]
+fn test_sweep_terminal_dust_after_withdraw_and_ledger_tick() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+    client.init(
+        &admin,
+        &String::from_str(&env, "SW002"),
+        &sme,
+        &1_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+    );
+    let investor = Address::generate(&env);
+    client.fund(&investor, &1_000i128);
+    client.withdraw();
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 10);
+
+    let stellar = StellarAssetClient::new(&env, &token);
+    stellar.mint(&escrow_id, &333i128);
+    let swept = client.sweep_terminal_dust(&333i128);
+    assert_eq!(swept, 333i128);
+}
+
+#[test]
+#[should_panic(expected = "dust sweep only in terminal states")]
+fn test_sweep_rejected_when_open() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+    client.init(
+        &admin,
+        &String::from_str(&env, "SW003"),
+        &sme,
+        &1_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+    );
+    let stellar = StellarAssetClient::new(&env, &token);
+    stellar.mint(&escrow_id, &100i128);
+    client.sweep_terminal_dust(&100i128);
+}
+
+#[test]
+#[should_panic(expected = "Legal hold blocks treasury dust sweep")]
+fn test_sweep_blocked_under_legal_hold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+    client.init(
+        &admin,
+        &String::from_str(&env, "SW004"),
+        &sme,
+        &1_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+    );
+    let investor = Address::generate(&env);
+    client.fund(&investor, &1_000i128);
+    client.settle();
+    client.set_legal_hold(&true);
+    client.sweep_terminal_dust(&1i128);
+}
+
+#[test]
+#[should_panic(expected = "sweep amount exceeds MAX_DUST_SWEEP_AMOUNT")]
+fn test_sweep_rejects_amount_above_dust_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+    client.init(
+        &admin,
+        &String::from_str(&env, "SW005"),
+        &sme,
+        &1_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+    );
+    let investor = Address::generate(&env);
+    client.fund(&investor, &1_000i128);
+    client.settle();
+    client.sweep_terminal_dust(&(MAX_DUST_SWEEP_AMOUNT + 1));
+}
+
+#[test]
+fn test_sweep_caps_at_contract_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+    client.init(
+        &admin,
+        &String::from_str(&env, "SW006"),
+        &sme,
+        &1_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+    );
+    let investor = Address::generate(&env);
+    client.fund(&investor, &1_000i128);
+    client.settle();
+
+    let stellar = StellarAssetClient::new(&env, &token);
+    stellar.mint(&escrow_id, &50i128);
+    let swept = client.sweep_terminal_dust(&100i128);
+    assert_eq!(swept, 50i128);
+}
+
+#[test]
+fn test_sweep_requires_treasury_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let escrow_id = env.register(LiquifactEscrow, ());
+    let client = LiquifactEscrowClient::new(&env, &escrow_id);
+    client.init(
+        &admin,
+        &String::from_str(&env, "SW007"),
+        &sme,
+        &1_000i128,
+        &100i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+    );
+    let investor = Address::generate(&env);
+    client.fund(&investor, &1_000i128);
+    client.settle();
+    let stellar = StellarAssetClient::new(&env, &token);
+    stellar.mint(&escrow_id, &10i128);
+
+    env.mock_auths(&[]);
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.sweep_terminal_dust(&10i128);
+    }));
+    assert!(err.is_err(), "sweep without treasury auth must fail");
 }
 
 // --- property-based tests ---
@@ -960,7 +1460,17 @@ proptest! {
         let client = deploy(&env);
 
         let target = 20_000_0000000i128;
-        client.init(&admin, &symbol_short!("INVTST"), &sme, &target, &800i64, &0u64);
+        client.init(
+            &admin,
+            &String::from_str(&env, "INVTST"),
+            &sme,
+            &target,
+            &800i64,
+            &0u64,
+            &Address::generate(&env),
+            &None,
+            &Address::generate(&env),
+        );
 
         let before = client.get_escrow().funded_amount;
         client.fund(&investor1, &amount1);
@@ -986,7 +1496,17 @@ proptest! {
         let investor = Address::generate(&env);
         let client = deploy(&env);
 
-        let escrow = client.init(&admin, &symbol_short!("INVSTA"), &sme, &target, &800i64, &0u64);
+        let escrow = client.init(
+            &admin,
+            &String::from_str(&env, "INVSTA"),
+            &sme,
+            &target,
+            &800i64,
+            &0u64,
+            &Address::generate(&env),
+            &None,
+            &Address::generate(&env),
+        );
         prop_assert_eq!(escrow.status, 0);
 
         let after_fund = client.fund(&investor, &amount);
