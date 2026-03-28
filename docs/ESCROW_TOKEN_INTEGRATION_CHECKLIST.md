@@ -38,9 +38,14 @@ The escrow contract and its documented assumptions do not support direct integra
 - Dynamic decimals, fractional units outside integer smallest-unit semantics
 - Malicious token contracts that alter balances in unexpected ways or change transfer metadata
 
+## Terminal dust sweep (`sweep_terminal_dust`)
+
+- The escrow uses [`escrow/src/external_calls.rs`](../escrow/src/external_calls.rs) to assert **exact** sender/recipient balance deltas for the configured **funding** token.
+- Integrations must still treat **fee-on-transfer** and other non-standard tokens as **unsupported**; such tokens can cause the sweep to panic when deltas do not match `amount`.
+
 ## Why this matters
 
-Because the contract only records numeric state and collateral metadata, token integration security is enforced by the surrounding application or bridge logic.
+Because the contract only records numeric state and collateral metadata (aside from the guarded dust sweep transfer path), token integration security is enforced by the surrounding application or bridge logic.
 
 - The escrow contract is safe for algebraic accounting of on-chain amounts.
 - The integration layer must reject unsupported token patterns before calling escrow entrypoints.
