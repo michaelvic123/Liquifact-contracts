@@ -25,6 +25,7 @@ fn init_escrow(
         &token,
         &None,
         &treasury,
+        &None,
     );
 }
 

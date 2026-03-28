@@ -36,17 +36,44 @@
 //! [`LiquifactEscrow::sweep_terminal_dust`] moves at most [`MAX_DUST_SWEEP_AMOUNT`] units of the
 //! bound funding token from this contract to the immutable **treasury** address, only when the
 //! escrow has reached a **terminal** [`InvoiceEscrow::status`] (settled or withdrawn). It cannot run
-//! during a legal hold. This is meant for rounding residue / stray transfers, not for settling
-//! live liabilities — integrations that custody principal on-chain must keep token balances
-//! reconciled with `funded_amount` so treasury sweeps cannot pull user funds.
+//! during a legal hold. Transfers go through [`crate::external_calls`] so **pre/post token balances**
+//! must match the requested amount (standard SEP-41 behavior); fee-on-transfer or malicious tokens
+//! are out of scope and should fail safe assertions. This is meant for rounding residue / stray
+//! transfers, not for settling live liabilities — integrations that custody principal on-chain must
+//! keep token balances reconciled with `funded_amount` so treasury sweeps cannot pull user funds.
+//!
+//! ## Ledger time trust model
+//!
+//! [`LiquifactEscrow::settle`] and [`LiquifactEscrow::claim_investor_payout`] compare against
+//! [`Env::ledger`] timestamps only (no wall-clock oracle). Maturity, per-investor **claim locks**
+//! from [`LiquifactEscrow::fund_with_commitment`], and [`FundingCloseSnapshot`] metadata must be
+//! interpreted as **validator-observed ledger time**, including possible skew between simulated and
+//! live networks—integrators should treat boundaries as `>=` / `<` tests on integer seconds.
+//!
+//! ## Optional tiered yield (immutable table at init)
+//!
+//! Pass `yield_tiers` to [`LiquifactEscrow::init`] as [`Option`] of a Soroban [`Vec`] of [`YieldTier`].
+//! The table is **immutable** for the escrow instance. Investors who use [`LiquifactEscrow::fund_with_commitment`]
+//! on their **first** deposit select an effective [`DataKey::InvestorEffectiveYield`] from the ladder;
+//! further principal from that address must use [`LiquifactEscrow::fund`]. **Fairness:** tiers are
+//! validated non-decreasing in both `min_lock_secs` and `yield_bps` relative to the base [`InvoiceEscrow::yield_bps`].
+//!
+//! ## Funding-close snapshot (pro-rata)
+//!
+//! When status first becomes **funded**, [`DataKey::FundingCloseSnapshot`] stores total principal
+//! (including over-funding past target), the target, and ledger timestamp/sequence. **Immutable** once
+//! written; off-chain pro-rata share for an investor is `get_contribution(addr) / snapshot.total_principal`
+//! in rational arithmetic (watch integer rounding off-chain).
 
 use soroban_sdk::{
     contract, contractevent, contractimpl, contracttype, symbol_short, token::TokenClient, Address,
-    Env, MuxedAddress, String, Symbol,
+    Env, String, Symbol, Vec,
 };
 
+pub(crate) mod external_calls;
+
 /// Current storage schema version (`DataKey::Version`).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Upper bound on [`LiquifactEscrow::sweep_terminal_dust`] per call (base units of the funding token).
 ///
@@ -83,6 +110,15 @@ pub enum DataKey {
     /// Optional registry contract id for indexers; **hint only**, not authority (see module rustdoc).
     /// Omitted from storage when unset at init.
     RegistryRef,
+    /// Immutable tier table when configured at [`LiquifactEscrow::init`]; omitted when tiering is off.
+    /// **Trust:** values are protocol-supplied at deploy; the contract never mutates this key after init.
+    YieldTierTable,
+    /// Set once when status first becomes **funded** (1); immutable thereafter (pro-rata denominator).
+    FundingCloseSnapshot,
+    /// Effective annualized yield in bps chosen at this investor’s **first** deposit (see tiered yield).
+    InvestorEffectiveYield(Address),
+    /// Minimum [`Env::ledger`] timestamp before [`LiquifactEscrow::claim_investor_payout`] (0 = no extra gate).
+    InvestorClaimNotBefore(Address),
 }
 
 // --- Data types ---
@@ -131,6 +167,28 @@ pub struct SmeCollateralCommitment {
     pub recorded_at: u64,
 }
 
+/// One step in an optional tier ladder: investors who commit to at least `min_lock_secs` (on first
+/// deposit via [`LiquifactEscrow::fund_with_commitment`]) may receive `yield_bps` for pro-rata /
+/// off-chain coupon math. **Immutable** after `init`: the table is fixed for the escrow instance.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct YieldTier {
+    pub min_lock_secs: u64,
+    pub yield_bps: i64,
+}
+
+/// Captured at the first ledger transition to **funded** so partial settlement / claims can use a
+/// stable total principal and target. **Immutable** once written.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FundingCloseSnapshot {
+    /// Sum of principal credited when the invoice became funded (`funded_amount` at close), including overflow past target.
+    pub total_principal: i128,
+    pub funding_target: i128,
+    pub closed_at_ledger_timestamp: u64,
+    pub closed_at_ledger_sequence: u32,
+}
+
 // --- Events ---
 
 #[contractevent]
@@ -149,6 +207,8 @@ pub struct EscrowFunded {
     pub amount: i128,
     pub funded_amount: i128,
     pub status: u32,
+    /// Investor-specific effective yield (bps) after this fund; see [`DataKey::InvestorEffectiveYield`].
+    pub investor_effective_yield_bps: i64,
 }
 
 #[contractevent]
@@ -265,6 +325,63 @@ impl LiquifactEscrow {
             .unwrap_or(false)
     }
 
+    fn validate_yield_tiers_table(tiers: &Option<Vec<YieldTier>>, base_yield: i64) {
+        let Some(tiers) = tiers else {
+            return;
+        };
+        if tiers.len() == 0 {
+            return;
+        }
+        let n = tiers.len();
+        for i in 0..n {
+            let t = tiers.get(i).unwrap();
+            assert!(
+                (0..=10_000).contains(&t.yield_bps),
+                "tier yield_bps must be 0..=10_000"
+            );
+            assert!(
+                t.yield_bps >= base_yield,
+                "tier yield_bps must be >= base yield_bps"
+            );
+            if i > 0 {
+                let p = tiers.get(i - 1).unwrap();
+                assert!(
+                    t.min_lock_secs > p.min_lock_secs,
+                    "tiers must have strictly increasing min_lock_secs"
+                );
+                assert!(
+                    t.yield_bps >= p.yield_bps,
+                    "tiers must have non-decreasing yield_bps"
+                );
+            }
+        }
+    }
+
+    fn effective_yield_for_commitment(env: &Env, base_yield: i64, committed_lock_secs: u64) -> i64 {
+        if committed_lock_secs == 0 {
+            return base_yield;
+        }
+        let Some(tiers) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<YieldTier>>(&DataKey::YieldTierTable)
+        else {
+            return base_yield;
+        };
+        if tiers.len() == 0 {
+            return base_yield;
+        }
+        let mut best = base_yield;
+        let n = tiers.len();
+        for i in 0..n {
+            let t = tiers.get(i).unwrap();
+            if committed_lock_secs >= t.min_lock_secs && t.yield_bps > best {
+                best = t.yield_bps;
+            }
+        }
+        best
+    }
+
     /// Initialize escrow. `funding_target` defaults to `amount`.
     ///
     /// Binds **`funding_token`**, **`treasury`**, and optional **`registry`** for this instance only.
@@ -288,6 +405,7 @@ impl LiquifactEscrow {
         funding_token: Address,
         registry: Option<Address>,
         treasury: Address,
+        yield_tiers: Option<Vec<YieldTier>>,
     ) -> InvoiceEscrow {
         admin.require_auth();
 
@@ -300,6 +418,8 @@ impl LiquifactEscrow {
             !env.storage().instance().has(&DataKey::Escrow),
             "Escrow already initialized"
         );
+
+        Self::validate_yield_tiers_table(&yield_tiers, yield_bps);
 
         let invoice_sym = validate_invoice_id_string(&env, &invoice_id);
 
@@ -325,6 +445,13 @@ impl LiquifactEscrow {
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         if let Some(ref r) = registry {
             env.storage().instance().set(&DataKey::RegistryRef, r);
+        }
+        if let Some(ref tiers) = yield_tiers {
+            if tiers.len() > 0 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::YieldTierTable, tiers);
+            }
         }
 
         EscrowInitialized {
@@ -407,7 +534,13 @@ impl LiquifactEscrow {
         let sweep_amt = amount.min(balance);
         assert!(sweep_amt > 0, "effective sweep amount is zero");
 
-        token.transfer(&this, &MuxedAddress::from(treasury.clone()), &sweep_amt);
+        external_calls::transfer_funding_token_with_balance_checks(
+            &env,
+            &token_addr,
+            &this,
+            &treasury,
+            sweep_amt,
+        );
 
         TreasuryDustSwept {
             name: symbol_short!("dust_sw"),
@@ -440,6 +573,29 @@ impl LiquifactEscrow {
         env.storage()
             .instance()
             .get(&DataKey::InvestorContribution(investor))
+            .unwrap_or(0)
+    }
+
+    /// Pro-rata denominator captured when the escrow first became **funded**; [`None`] until then.
+    pub fn get_funding_close_snapshot(env: Env) -> Option<FundingCloseSnapshot> {
+        env.storage().instance().get(&DataKey::FundingCloseSnapshot)
+    }
+
+    /// Effective yield (bps) for this investor after their **first** deposit; later [`LiquifactEscrow::fund`]
+    /// calls add principal at this rate. Defaults to [`InvoiceEscrow::yield_bps`] when unset (legacy positions).
+    pub fn get_investor_yield_bps(env: Env, investor: Address) -> i64 {
+        let escrow = Self::get_escrow(env.clone());
+        env.storage()
+            .instance()
+            .get(&DataKey::InvestorEffectiveYield(investor.clone()))
+            .unwrap_or(escrow.yield_bps)
+    }
+
+    /// Earliest ledger timestamp for [`LiquifactEscrow::claim_investor_payout`]; `0` if not gated.
+    pub fn get_investor_claim_not_before(env: Env, investor: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::InvestorClaimNotBefore(investor))
             .unwrap_or(0)
     }
 
@@ -562,7 +718,32 @@ impl LiquifactEscrow {
         );
     }
 
+    /// Record investor principal while the invoice is **open**. First deposit sets base
+    /// [`InvoiceEscrow::yield_bps`] for this investor; further amounts must use this method (not
+    /// [`LiquifactEscrow::fund_with_commitment`]) so tier selection stays immutable after the first leg.
     pub fn fund(env: Env, investor: Address, amount: i128) -> InvoiceEscrow {
+        Self::fund_impl(env, investor, amount, true, 0)
+    }
+
+    /// First deposit only (per investor): optional longer lock and tier ladder from [`DataKey::YieldTierTable`].
+    /// Sets [`DataKey::InvestorClaimNotBefore`] when `committed_lock_secs > 0`. Additional principal
+    /// from the same investor must use [`LiquifactEscrow::fund`].
+    pub fn fund_with_commitment(
+        env: Env,
+        investor: Address,
+        amount: i128,
+        committed_lock_secs: u64,
+    ) -> InvoiceEscrow {
+        Self::fund_impl(env, investor, amount, false, committed_lock_secs)
+    }
+
+    fn fund_impl(
+        env: Env,
+        investor: Address,
+        amount: i128,
+        simple_fund: bool,
+        committed_lock_secs: u64,
+    ) -> InvoiceEscrow {
         investor.require_auth();
 
         assert!(amount > 0, "Funding amount must be positive");
@@ -574,29 +755,82 @@ impl LiquifactEscrow {
         );
         assert!(escrow.status == 0, "Escrow not open for funding");
 
+        let contribution_key = DataKey::InvestorContribution(investor.clone());
+        let prev: i128 = env.storage().instance().get(&contribution_key).unwrap_or(0);
+
+        if simple_fund {
+            if prev == 0 {
+                env.storage().instance().set(
+                    &DataKey::InvestorEffectiveYield(investor.clone()),
+                    &escrow.yield_bps,
+                );
+                env.storage()
+                    .instance()
+                    .set(&DataKey::InvestorClaimNotBefore(investor.clone()), &0u64);
+            }
+        } else {
+            assert!(
+                prev == 0,
+                "Additional principal after a tiered first deposit must use fund(), not fund_with_commitment()"
+            );
+            let eff =
+                Self::effective_yield_for_commitment(&env, escrow.yield_bps, committed_lock_secs);
+            env.storage()
+                .instance()
+                .set(&DataKey::InvestorEffectiveYield(investor.clone()), &eff);
+            let now = env.ledger().timestamp();
+            let claim_nb = if committed_lock_secs == 0 {
+                0u64
+            } else {
+                now.checked_add(committed_lock_secs)
+                    .expect("investor claim time overflow")
+            };
+            env.storage().instance().set(
+                &DataKey::InvestorClaimNotBefore(investor.clone()),
+                &claim_nb,
+            );
+        }
+
         escrow.funded_amount = escrow
             .funded_amount
             .checked_add(amount)
             .expect("funded_amount overflow");
-        if escrow.funded_amount >= escrow.funding_target {
+
+        if escrow.status == 0 && escrow.funded_amount >= escrow.funding_target {
             escrow.status = 1;
+            if !env.storage().instance().has(&DataKey::FundingCloseSnapshot) {
+                let snap = FundingCloseSnapshot {
+                    total_principal: escrow.funded_amount,
+                    funding_target: escrow.funding_target,
+                    closed_at_ledger_timestamp: env.ledger().timestamp(),
+                    closed_at_ledger_sequence: env.ledger().sequence(),
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::FundingCloseSnapshot, &snap);
+            }
         }
 
-        let contribution_key = DataKey::InvestorContribution(investor.clone());
-        let prev: i128 = env.storage().instance().get(&contribution_key).unwrap_or(0);
         env.storage()
             .instance()
             .set(&contribution_key, &(prev + amount));
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
 
+        let investor_effective_yield_bps = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvestorEffectiveYield(investor.clone()))
+            .unwrap_or(escrow.yield_bps);
+
         EscrowFunded {
             name: symbol_short!("funded"),
             invoice_id: escrow.invoice_id.clone(),
-            investor,
+            investor: investor.clone(),
             amount,
             funded_amount: escrow.funded_amount,
             status: escrow.status,
+            investor_effective_yield_bps,
         }
         .publish(&env);
 
@@ -684,6 +918,17 @@ impl LiquifactEscrow {
         assert!(
             escrow.status == 2,
             "Escrow must be settled before investor claim"
+        );
+
+        let not_before: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvestorClaimNotBefore(investor.clone()))
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        assert!(
+            now >= not_before,
+            "Investor commitment lock not expired (ledger timestamp)"
         );
 
         let key = DataKey::InvestorClaimed(investor.clone());

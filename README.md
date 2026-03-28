@@ -6,12 +6,15 @@ Soroban smart contracts for **LiquiFact** on Stellar. This repository contains t
 
 | Method | Purpose |
 |--------|---------|
-| `init` | Create escrow (admin auth). Sets `funding_target = amount`. Binds **`funding_token`**, **`treasury`**, optional **`registry`**; validates **`invoice_id`** string (length ≤ 32, charset `[A-Za-z0-9_]`). |
+| `init` | Create escrow (admin auth). Sets `funding_target = amount`. Binds **`funding_token`**, **`treasury`**, optional **`registry`**, optional **`yield_tiers`** ([`YieldTier`](escrow/src/lib.rs) Soroban [`Vec`]); validates **`invoice_id`** string (length ≤ 32, charset `[A-Za-z0-9_]`). |
 | `get_escrow` / `get_version` / `get_legal_hold` | Read state. |
 | `get_funding_token` / `get_treasury` / `get_registry_ref` | Immutable funding asset, treasury for dust recovery, optional registry hint (`None` if unset at init). |
 | `get_contribution` | Per-investor funded principal. |
 | `update_funding_target` | Admin, open state only; target ≥ `funded_amount`. |
-| `fund` | Investor auth; blocked while legal hold is active. |
+| `fund` | Investor auth; blocked while legal hold is active. First deposit fixes per-investor **effective yield** (base `yield_bps`) and clears claim lock unless set by `fund_with_commitment`. |
+| `fund_with_commitment` | **First deposit only** for that investor when using a commitment window: sets **effective yield** from optional tier table and **`InvestorClaimNotBefore`** when `committed_lock_secs > 0`. Further amounts use `fund`. |
+| `get_funding_close_snapshot` | [`Option`] of immutable close record when status first became **funded** (pro-rata denominator). |
+| `get_investor_yield_bps` / `get_investor_claim_not_before` | Read per-investor tier outcome and claim lock. |
 | `withdraw` | SME auth; funded → withdrawn; blocked under legal hold. |
 | `settle` | SME auth; funded → settled (maturity gate if set); blocked under legal hold. |
 | `claim_investor_payout` | Investor auth; after settle; blocked under legal hold. |
@@ -32,9 +35,25 @@ Soroban smart contracts for **LiquiFact** on Stellar. This repository contains t
 
 Off-chain invoice slugs should match the same rules enforced in `init`: non-empty, length ≤ 32 (Soroban `Symbol` maximum), characters in `[A-Za-z0-9_]` only (SEP-style slugs; no spaces, punctuation, or Unicode).
 
+### Cross-contract token safety (issue #108)
+
+`sweep_terminal_dust` delegates the SEP-41 `transfer` to [`escrow/src/external_calls.rs`](escrow/src/external_calls.rs), which records **sender and recipient balances before/after** and requires exact `amount` deltas. Only [`DataKey::FundingToken`] is used for this path (trust list in module rustdoc). Soroban does not exhibit classic EVM-style synchronous reentrancy into this contract mid-transfer; token implementations are still treated as adversarial for **balance correctness**. Unsupported token economics (fee-on-transfer) should trip assertions.
+
+### Ledger time boundaries (issue #106)
+
+There is no separate on-chain **funding deadline** or **grace-period** field beyond **maturity** on [`InvoiceEscrow`] and optional **per-investor claim locks** from `fund_with_commitment`. Tests exercise off-by-one behavior around maturity (`now >= maturity`) and exact **funded** transitions (`funded_amount >= funding_target`). Integrators should assume **ledger timestamp skew** across validators matches Stellar norms and test boundary predicates accordingly.
+
+### Optional tiered yield (issue #110)
+
+When `init` receives a non-empty `yield_tiers` vector, tiers must have strictly increasing `min_lock_secs`, non-decreasing `yield_bps`, and every tier `yield_bps >=` base `yield_bps`. `fund_with_commitment(investor, amount, committed_lock_secs)` selects the best matching tier on the **first** deposit only; **`tier selection is immutable after that investor’s first leg`** (additional principal uses `fund` at the stored effective yield). **Rounding:** yields are integer basis points only; currency rounding for coupon cash flows belongs off-chain.
+
+### Funding-close snapshot (issue #117)
+
+On the first transition to **funded**, the contract persists [`FundingCloseSnapshot`](escrow/src/lib.rs): `total_principal` equals `funded_amount` at that instant (so **overfunding is absorbed** in the snapshot total), `funding_target`, and ledger timestamp/sequence. The snapshot is **immutable**; deterministic pro-rata uses `get_contribution(investor) / total_principal` with rational math off-chain.
+
 ### Treasury dust sweep (issue #107)
 
-`sweep_terminal_dust(amount)` moves `min(amount, balance, MAX_DUST_SWEEP_AMOUNT)` of the **bound** funding token from the escrow contract to **`treasury`**. It is only callable in **status 2 (settled)** or **status 3 (withdrawn)** so **open** or **funded** escrows cannot be drained as “dust.” Legal hold blocks sweeps. **`fund` does not move tokens** in this version; if custodial flows are added later, token balances must stay reconciled with ledger fields so sweeps cannot pull user principal. Tokens sent to this contract in **other** assets are not touched by this hook.
+`sweep_terminal_dust(amount)` moves `min(amount, balance, MAX_DUST_SWEEP_AMOUNT)` of the **bound** funding token from the escrow contract to **`treasury`**, using the safety wrapper above. It is only callable in **status 2 (settled)** or **status 3 (withdrawn)** so **open** or **funded** escrows cannot be drained as “dust.” Legal hold blocks sweeps. **`fund` does not move tokens** in this version; if custodial flows are added later, token balances must stay reconciled with ledger fields so sweeps cannot pull user principal. Tokens sent to this contract in **other** assets are not touched by this hook.
 
 ### Optional SME collateral (record-only)
 
@@ -46,7 +65,7 @@ When `DataKey::LegalHold` is true, the contract rejects new `fund`, `settle`, SM
 
 ### Storage keys (`DataKey`)
 
-Public enum in [`escrow/src/lib.rs`](escrow/src/lib.rs): `Escrow`, `Version`, `InvestorContribution(Address)`, `LegalHold`, `SmeCollateralPledge`, `InvestorClaimed(Address)`, `FundingToken`, `Treasury`, `RegistryRef` (present only when set at init). New optional keys should keep **additive** names and avoid reusing or repurposing existing variants.
+Public enum in [`escrow/src/lib.rs`](escrow/src/lib.rs): `Escrow`, `Version`, `InvestorContribution(Address)`, `LegalHold`, `SmeCollateralPledge`, `InvestorClaimed(Address)`, `FundingToken`, `Treasury`, `RegistryRef` (present only when set at init), optional `YieldTierTable`, `FundingCloseSnapshot`, `InvestorEffectiveYield(Address)`, `InvestorClaimNotBefore(Address)`. New optional keys should keep **additive** names and avoid reusing or repurposing existing variants.
 
 ---
 
@@ -111,7 +130,7 @@ stellar contract deploy \
 # Record emitted contract id as LIQUIFACT_ESCROW_CONTRACT_ID
 ```
 
-Initialize on-chain with `init` via `stellar contract invoke` (pass `admin`, **`invoice_id` as string**, `sme_address`, amounts, `yield_bps`, `maturity`, **`funding_token`**, **`registry`** as optional address, **`treasury`** per your product).
+Initialize on-chain with `init` via `stellar contract invoke` (pass `admin`, **`invoice_id` as string**, `sme_address`, amounts, `yield_bps`, `maturity`, **`funding_token`**, **`registry`** as optional address, **`treasury`**, **`yield_tiers`** as optional vector per your product).
 
 ### Verify artifact hash
 
@@ -157,7 +176,9 @@ See [`docs/ESCROW_TOKEN_INTEGRATION_CHECKLIST.md`](docs/ESCROW_TOKEN_INTEGRATION
 - **Collateral record:** is not proof of encumbrance until a future version explicitly enforces token transfers.
 - **Token integration:** external token transfers and token safety validation must live in the integration layer; this contract stores only numeric amount state and collateral metadata.
 - **Overflow:** `fund` uses `checked_add` on `funded_amount`.
-- **Dust sweep:** gated on **terminal** escrow status, per-call **cap** ([`MAX_DUST_SWEEP_AMOUNT`]), actual **balance**, **legal hold**, and **treasury** auth; only the **configured** SEP-41 token is transferred. Wrong-asset or oversized balances still require operational discipline — the hook is not a general-purpose withdrawal for live liabilities.
+- **Dust sweep:** gated on **terminal** escrow status, per-call **cap** ([`MAX_DUST_SWEEP_AMOUNT`]), actual **balance**, **legal hold**, and **treasury** auth; only the **configured** SEP-41 token is transferred, with **post-transfer balance equality** checks in [`external_calls`](escrow/src/external_calls.rs). Wrong-asset or oversized balances still require operational discipline — the hook is not a general-purpose withdrawal for live liabilities.
+- **Tiered yield / claim locks:** first-deposit discipline (`fund` vs `fund_with_commitment`) prevents changing an investor’s tier after their initial leg; claim timestamps are ledger-based.
+- **Funding snapshot:** single-write immutability avoids shifting pro-rata denominators after close.
 - **Registry ref:** stored for discoverability only; it must not be used as an authority without verifying behavior of the registry contract off-chain or in a dedicated integration.
 
 ### Contract type clone/derive safety
