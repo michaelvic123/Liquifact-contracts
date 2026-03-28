@@ -25,6 +25,18 @@ Soroban smart contracts for **LiquiFact** on Stellar. This repository contains t
 | `update_maturity` | Admin, open state only. |
 | `transfer_admin` | Admin rotation. |
 | `migrate` | Version guardrails (see upgrade policy below). |
+| `enable_allowlist` / `disable_allowlist` | Admin toggles the investor allowlist gate. |
+| `add_to_allowlist` / `remove_from_allowlist` | Admin manages approved investor addresses. |
+| `is_allowlisted` / `is_allowlist_enabled` | Read allowlist state. |
+
+### Optional investor allowlist (closed / regulated rounds)
+
+When `enable_allowlist` is called, only addresses explicitly added via `add_to_allowlist` may call `fund` or `fund_with_commitment`. Unapproved callers panic with `"Investor not on allowlist"`.
+
+- The gate is **off by default** — existing open-round escrows are unaffected.
+- Per-address entries persist across `disable_allowlist` / `enable_allowlist` cycles; re-enabling restores the same approved set.
+- Each allowlist check is a single `O(1)` instance-storage lookup — gas cost does not grow with list size.
+- Only `admin` may enable/disable the gate or add/remove entries.
 
 ### Per-instance funding asset and registry (issues #113, #116)
 
