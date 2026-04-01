@@ -62,6 +62,13 @@ invariants:
     math: "if cap = MaxUniqueInvestorsCap then #{investor : contribution(investor) > 0} ≤ cap"
     tests:
       - test::test_max_unique_investors_cap_enforced
+
+  - id: ESC-INI-001
+    name: single_initialization_guard
+    math: "Initialized key set exactly once; subsequent init calls panic"
+    tests:
+      - test::test_double_init_panics
+      - test::test_init_sets_initialized_flag
 ```
 
 ## New init parameters
@@ -84,6 +91,7 @@ invariants:
 Use as a human gate; not a substitute for professional audit.
 
 - [ ] `admin` is a multisig or governed contract (legal hold and attestation are admin-gated).
+- [ ] Escrow has a **single-initialization guard** to prevent re-initialization after deployment.
 - [ ] Funding token is standard SEP-41; fee-on-transfer tokens are out of scope (see module docs and `docs/ESCROW_TOKEN_INTEGRATION_CHECKLIST.md`).
 - [ ] `min_contribution` and `max_unique_investors` match the legal offering (floor vs. target; cap is per-address, not KYC’d entity).
 - [ ] Attestation digests match the intended off-chain bundle (hash algorithm and canonical encoding documented off-chain).
