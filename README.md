@@ -118,6 +118,11 @@ Exact CLI flags change between Soroban releases; always cross-check [Stellar Sor
 ```bash
 rustup target add wasm32v1-none
 cargo build --target wasm32v1-none --release
+# Lint the escrow crate (mirrors CI)
+cargo clippy -p escrow -- -D warnings
+
+# Lint the entire workspace
+cargo clippy --all-targets -- -D warnings
 # Artifact (typical):
 # target/wasm32v1-none/release/liquifact_escrow.wasm
 ```
