@@ -957,6 +957,7 @@ impl LiquifactEscrow {
                     .instance()
                     .set(&DataKey::InvestorClaimNotBefore(investor.clone()), &0u64);
             }
+            // If prev > 0, preserve existing effective yield and claim lock
         } else {
             assert!(
                 prev == 0,

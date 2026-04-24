@@ -632,3 +632,67 @@ fn test_ledger_sequence_recorded_in_snapshot_with_tick() {
     let snap = client.get_funding_close_snapshot().unwrap();
     assert_eq!(snap.closed_at_ledger_sequence, seq);
 }
+
+#[test]
+fn test_fund_with_commitment_then_fund_preserves_effective_yield() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let inv = Address::generate(&env);
+    let (tok, tre) = free_addresses(&env);
+    let mut tiers = SorobanVec::new(&env);
+    tiers.push_back(YieldTier {
+        min_lock_secs: 100,
+        yield_bps: 900,
+    });
+    tiers.push_back(YieldTier {
+        min_lock_secs: 500,
+        yield_bps: 1100,
+    });
+    client.init(
+        &admin,
+        &String::from_str(&env, "YIELD001"),
+        &sme,
+        &10_000i128,
+        &800i64,
+        &0u64,
+        &tok,
+        &None,
+        &tre,
+        &Some(tiers),
+        &None,
+        &None,
+    );
+    // First deposit with commitment: 200 secs lock → tier 1 (900 bps)
+    client.fund_with_commitment(&inv, &5_000i128, &200u64);
+    let yield_after_commitment = client.get_investor_yield_bps(&inv);
+    assert_eq!(
+        yield_after_commitment, 900,
+        "Yield after commitment should be 900 bps"
+    );
+
+    let claim_not_before_after_commitment = client.get_investor_claim_not_before(&inv);
+    assert!(
+        claim_not_before_after_commitment > 0,
+        "Claim lock should be set after commitment"
+    );
+
+    // Second deposit without commitment: should preserve the 900 bps yield
+    client.fund(&inv, &5_000i128);
+    let yield_after_fund = client.get_investor_yield_bps(&inv);
+    assert_eq!(
+        yield_after_fund, 900,
+        "Effective yield should be preserved after subsequent fund call"
+    );
+
+    // Claim lock should also be preserved
+    let claim_not_before_after_fund = client.get_investor_claim_not_before(&inv);
+    assert_eq!(
+        claim_not_before_after_commitment, claim_not_before_after_fund,
+        "Claim lock should be preserved after subsequent fund call"
+    );
+
+    assert_eq!(client.get_escrow().status, 1, "Escrow should be funded");
+}
