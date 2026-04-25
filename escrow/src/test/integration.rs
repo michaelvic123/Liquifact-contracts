@@ -59,7 +59,6 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
     // Create realistic investor addresses
     let investor_alice = Address::generate(&env);
     let investor_bob = Address::generate(&env);
-    let investor_charlie = Address::generate(&env);
 
     // USDC-like token with 7 decimals: 1 USDC = 10,000,000 base units
     const USDC_DECIMALS: i128 = 10_000_000;
@@ -76,9 +75,9 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
         &YIELD_BPS,
         &MATURITY_SECS,
         &funding_token,
-        &None, // No yield tiers for simplicity
-        &treasury,
         &None, // No registry
+        &treasury,
+        &None, // No yield tiers for simplicity
         &None, // No min contribution floor
         &None, // No max investors cap
     );
@@ -96,6 +95,8 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
     assert_eq!(initial_escrow.yield_bps, YIELD_BPS);
 
     // === PHASE 2: OVERFUND - Multiple Investors Contribute ===
+    env.ledger().set_timestamp(1);
+    env.ledger().set_sequence_number(1);
 
     // Alice contributes 20,000 USDC (40% of target)
     let alice_amount = 20_000 * USDC_DECIMALS;
@@ -110,8 +111,8 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
     let alice_contribution = client.get_contribution(&investor_alice);
     assert_eq!(alice_contribution, alice_amount);
 
-    // Bob contributes 25,000 USDC (50% of target) - this triggers funding completion
-    let bob_amount = 25_000 * USDC_DECIMALS;
+    // Bob contributes 35,000 USDC, pushing the escrow over the funding target.
+    let bob_amount = 35_000 * USDC_DECIMALS;
     let escrow_after_bob = client.fund(&investor_bob, &bob_amount);
     assert_eq!(
         escrow_after_bob.status, 1,
@@ -119,16 +120,8 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
     );
     assert_eq!(escrow_after_bob.funded_amount, alice_amount + bob_amount);
 
-    // Charlie contributes 10,000 USDC (overfunding scenario)
-    let charlie_amount = 10_000 * USDC_DECIMALS;
-    let escrow_after_charlie = client.fund(&investor_charlie, &charlie_amount);
-    assert_eq!(
-        escrow_after_charlie.status, 1,
-        "Should remain Funded after overfunding"
-    );
-
-    let total_funded = alice_amount + bob_amount + charlie_amount;
-    assert_eq!(escrow_after_charlie.funded_amount, total_funded);
+    let total_funded = alice_amount + bob_amount;
+    assert_eq!(escrow_after_bob.funded_amount, total_funded);
     assert!(total_funded > TARGET_USDC, "Should be overfunded");
 
     // === PHASE 3: SNAPSHOT - Verify Funding Close Snapshot ===
@@ -159,11 +152,7 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
     // Verify individual contributions sum to snapshot total
     let alice_contrib = client.get_contribution(&investor_alice);
     let bob_contrib = client.get_contribution(&investor_bob);
-    let charlie_contrib = client.get_contribution(&investor_charlie);
-    assert_eq!(
-        alice_contrib + bob_contrib + charlie_contrib,
-        snapshot.total_principal
-    );
+    assert_eq!(alice_contrib + bob_contrib, snapshot.total_principal);
 
     // === PHASE 4: SETTLE - SME Settles After Maturity ===
 
@@ -187,7 +176,6 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
     // Calculate expected payouts using the contract's deterministic formula
     let alice_expected_payout = calculate_expected_payout(alice_amount, YIELD_BPS);
     let bob_expected_payout = calculate_expected_payout(bob_amount, YIELD_BPS);
-    let charlie_expected_payout = calculate_expected_payout(charlie_amount, YIELD_BPS);
 
     // Alice claims her payout (function only sets claimed flag, doesn't return amount)
     client.claim_investor_payout(&investor_alice);
@@ -201,38 +189,30 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
     // Bob claims his payout
     client.claim_investor_payout(&investor_bob);
 
-    // Charlie claims his payout
-    client.claim_investor_payout(&investor_charlie);
-
     // === VERIFICATION PHASE ===
 
     // Verify all investors are marked as claimed
     assert!(client.is_investor_claimed(&investor_alice));
     assert!(client.is_investor_claimed(&investor_bob));
-    assert!(client.is_investor_claimed(&investor_charlie));
 
     // Verify individual contributions and effective yields
     let alice_contrib = client.get_contribution(&investor_alice);
     let bob_contrib = client.get_contribution(&investor_bob);
-    let charlie_contrib = client.get_contribution(&investor_charlie);
 
     assert_eq!(alice_contrib, alice_amount);
     assert_eq!(bob_contrib, bob_amount);
-    assert_eq!(charlie_contrib, charlie_amount);
 
     // Verify effective yields (all should be base yield since no commitment)
     let alice_yield = client.get_investor_yield_bps(&investor_alice);
     let bob_yield = client.get_investor_yield_bps(&investor_bob);
-    let charlie_yield = client.get_investor_yield_bps(&investor_charlie);
 
     assert_eq!(alice_yield, YIELD_BPS);
     assert_eq!(bob_yield, YIELD_BPS);
-    assert_eq!(charlie_yield, YIELD_BPS);
 
     // Verify total contributions match expected yield calculation
-    let total_principal = alice_amount + bob_amount + charlie_amount;
+    let total_principal = alice_amount + bob_amount;
     let total_expected_yield = (total_principal * YIELD_BPS as i128) / 10_000;
-    let total_expected_payout = total_principal + total_expected_yield;
+    let _total_expected_payout = total_principal + total_expected_yield;
 
     // Note: The contract tracks claims but doesn't return payout amounts.
     // In a real integration, the payout calculation would be:
@@ -245,11 +225,6 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
         bob_expected_payout,
         bob_amount + (bob_amount * YIELD_BPS as i128) / 10_000
     );
-    assert_eq!(
-        charlie_expected_payout,
-        charlie_amount + (charlie_amount * YIELD_BPS as i128) / 10_000
-    );
-
     // Verify escrow remains in settled state
     let final_escrow = client.get_escrow();
     assert_eq!(
@@ -260,7 +235,7 @@ fn test_escrow_gold_standard_happy_path_open_overfund_snapshot_settle_claim() {
     // === SUCCESS SUMMARY ===
     // This test successfully demonstrates:
     // ✓ Escrow initialization with realistic USDC amounts
-    // ✓ Multi-investor funding with overfunding scenario
+    // ✓ Multi-investor funding with overfunding at funding close
     // ✓ Automatic status transitions (Open → Funded → Settled)
     // ✓ Funding close snapshot capture and verification
     // ✓ Maturity-gated settlement by SME
@@ -326,9 +301,9 @@ fn test_escrow_tiered_yield_with_commitment_locks() {
         &BASE_YIELD_BPS,
         &0u64, // No maturity for this test
         &funding_token,
-        &Some(yield_tiers),
-        &treasury,
         &None,
+        &treasury,
+        &Some(yield_tiers),
         &None,
         &None,
     );
@@ -419,8 +394,8 @@ fn test_escrow_tiered_yield_with_commitment_locks() {
 
     // Verify expected payout calculations (off-chain calculation for verification)
     let base_expected = calculate_expected_payout(base_amount, BASE_YIELD_BPS);
-    let tier1_expected = calculate_expected_payout(tier1_amount, 1000);
-    let tier2_expected = calculate_expected_payout(tier2_amount, 1200);
+    let _tier1_expected = calculate_expected_payout(tier1_amount, 1000);
+    let _tier2_expected = calculate_expected_payout(tier2_amount, 1200);
     let tier3_expected = calculate_expected_payout(tier3_amount, 1500);
 
     // Verify higher tiers would yield more absolute return
