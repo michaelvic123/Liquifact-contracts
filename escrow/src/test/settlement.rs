@@ -434,6 +434,101 @@ fn test_claim_succeeds_after_commitment_and_settle() {
 }
 
 #[test]
+fn test_claim_gating_exact_timestamp() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let inv = Address::generate(&env);
+    let (tok, tre) = free_addresses(&env);
+
+    env.ledger().set_timestamp(1000);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "LOCK003"),
+        &sme,
+        &1_000i128,
+        &400i64,
+        &0u64,
+        &tok,
+        &None,
+        &tre,
+        &None,
+        &None,
+        &None,
+    );
+
+    let lock_duration = 500u64;
+    client.fund_with_commitment(&inv, &1_000i128, &lock_duration);
+    client.settle();
+
+    let expiry = 1000 + lock_duration;
+
+    // 1 second before expiry
+    env.ledger().set_timestamp(expiry - 1);
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.claim_investor_payout(&inv);
+    }));
+    assert!(err.is_err(), "Claim should be blocked 1s before expiry");
+
+    // Exact expiry
+    env.ledger().set_timestamp(expiry);
+    client.claim_investor_payout(&inv);
+    assert!(client.is_investor_claimed(&inv));
+}
+
+#[test]
+fn test_claim_gating_with_multiple_investors() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let inv1 = Address::generate(&env);
+    let inv2 = Address::generate(&env);
+    let (tok, tre) = free_addresses(&env);
+
+    env.ledger().set_timestamp(1000);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "LOCK004"),
+        &sme,
+        &2_000i128,
+        &400i64,
+        &0u64,
+        &tok,
+        &None,
+        &tre,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.fund_with_commitment(&inv1, &1_000i128, &100u64); // Expiry 1100
+    client.fund_with_commitment(&inv2, &1_000i128, &200u64); // Expiry 1200
+    client.settle();
+
+    env.ledger().set_timestamp(1150);
+
+    // inv1 can claim
+    client.claim_investor_payout(&inv1);
+    assert!(client.is_investor_claimed(&inv1));
+
+    // inv2 still blocked
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.claim_investor_payout(&inv2);
+    }));
+    assert!(err.is_err(), "inv2 should still be blocked at 1150");
+
+    env.ledger().set_timestamp(1200);
+    client.claim_investor_payout(&inv2);
+    assert!(client.is_investor_claimed(&inv2));
+}
+
+#[test]
 fn test_cost_baseline_settle() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
