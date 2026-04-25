@@ -319,8 +319,9 @@ pub struct SmeWithdrew {
 pub struct InvestorPayoutClaimed {
     #[topic]
     pub name: Symbol,
-    pub invoice_id: Symbol,
+    #[topic]
     pub investor: Address,
+    pub invoice_id: Symbol,
 }
 
 #[contractevent]
@@ -1179,6 +1180,14 @@ impl LiquifactEscrow {
 
         investor.require_auth();
 
+        // Ensure the caller is actually an investor with a recorded contribution.
+        let contribution: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvestorContribution(investor.clone()))
+            .unwrap_or(0);
+        assert!(contribution > 0, "Address has no contribution to claim");
+
         let escrow = Self::get_escrow(env.clone());
         assert!(
             escrow.status == 2,
@@ -1197,17 +1206,16 @@ impl LiquifactEscrow {
         );
 
         let key = DataKey::InvestorClaimed(investor.clone());
-        assert!(
-            !env.storage().instance().get(&key).unwrap_or(false),
-            "Investor already claimed"
-        );
+        if env.storage().instance().get(&key).unwrap_or(false) {
+            return;
+        }
 
         env.storage().instance().set(&key, &true);
 
         InvestorPayoutClaimed {
             name: symbol_short!("inv_claim"),
-            invoice_id: escrow.invoice_id.clone(),
             investor,
+            invoice_id: escrow.invoice_id.clone(),
         }
         .publish(&env);
     }
