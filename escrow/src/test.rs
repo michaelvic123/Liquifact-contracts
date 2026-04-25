@@ -58,4 +58,49 @@ pub(super) fn default_init(
     );
 }
 
+/// Helper to create a realistic USDC-style escrow initialization for integration tests.
+/// Uses 7 decimal places (10,000,000 base units = 1 USDC) and reasonable parameters.
+pub(super) fn setup_realistic_usdc_escrow(
+    client: &LiquifactEscrowClient<'_>,
+    env: &Env,
+    admin: &Address,
+    sme: &Address,
+    target_usdc: i128,
+    yield_bps: i64,
+    maturity_secs: u64,
+) -> (Address, Address) {
+    let (funding_token, treasury) = free_addresses(env);
+    let usdc_decimals = 10_000_000i128; // 7 decimals
+    let target_base_units = target_usdc * usdc_decimals;
+    
+    client.init(
+        admin,
+        &String::from_str(env, "USDC001"),
+        sme,
+        &target_base_units,
+        &yield_bps,
+        &maturity_secs,
+        &funding_token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+    );
+    
+    (funding_token, treasury)
+}
+
+/// Helper to create multiple test investors with generated addresses.
+pub(super) fn create_test_investors(env: &Env, count: usize) -> Vec<Address> {
+    (0..count).map(|_| Address::generate(env)).collect()
+}
+
+/// Helper to advance ledger time for maturity testing.
+pub(super) fn advance_time_to_maturity(env: &Env, maturity_secs: u64) {
+    env.ledger().with_mut(|li| {
+        li.timestamp = maturity_secs + 1;
+    });
+}
+
 pub(super) const TARGET: i128 = 10_000_0000000i128;
