@@ -62,9 +62,9 @@ fn init_funded(
 /// Initialise, fund, settle, return (escrow_id, token, treasury).
 fn init_settled<'a>(
     env: &'a Env,
-    admin: &'a Address,
-    sme: &'a Address,
-    investor: &'a Address,
+    admin: &Address,
+    sme: &Address,
+    investor: &Address,
     id: &str,
 ) -> (LiquifactEscrowClient<'a>, Address, Address, Address) {
     let sac = env.register_stellar_asset_contract_v2(Address::generate(env));

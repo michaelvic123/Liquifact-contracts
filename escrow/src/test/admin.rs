@@ -156,9 +156,12 @@ fn test_migrate_wrong_from_version_panics() {
 #[should_panic]
 fn test_migrate_no_path_branch() {
     let env = Env::default();
-    let (client, _, _) = setup(&env);
+    env.mock_all_auths();
+    let (contract_id, client) = deploy_with_id(&env);
     // Simulate an older version 4 already in storage.
-    env.storage().instance().set(&DataKey::Version, &4u32);
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Version, &4u32);
+    });
     // migrate(4) should hit the "No migration path" branch.
     client.migrate(&4u32);
 }
