@@ -53,6 +53,18 @@
 //! host function runs to completion before this contract resumes. **Still** treat the token as
 //! adversarial for **correctness of balances**: always record pre/post balances around transfers so
 //! integration bugs and non-compliant tokens are caught at the host boundary.
+//!
+//! ## Reviewer timeline (host-call boundary)
+//!
+//! `transfer_funding_token_with_balance_checks` follows this sequence:
+//! 1. Read sender/recipient balances before transfer.
+//! 2. Invoke SEP-41 `transfer` on the configured token contract.
+//! 3. Soroban host executes that token call to completion, then returns.
+//! 4. Read sender/recipient balances after transfer.
+//! 5. Assert exact conservation (`spent == amount` and `received == amount`).
+//!
+//! Security takeaway: this is not relying on "non-reentrancy" as a magic property. It enforces
+//! post-call accounting invariants at the external-call boundary where token behavior is observed.
 
 use soroban_sdk::{token::TokenClient, Address, Env, MuxedAddress};
 
