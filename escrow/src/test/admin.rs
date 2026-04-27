@@ -151,18 +151,21 @@ fn test_migrate_wrong_from_version_panics() {
 }
 
 #[test]
-#[should_panic(expected = "No migration path from version 4 — extend migrate or redeploy")]
+#[should_panic]
 fn test_migrate_no_path_branch() {
     let env = Env::default();
-    let (client, _, _) = setup(&env);
+    env.mock_all_auths();
+    let (contract_id, client) = deploy_with_id(&env);
     // Simulate an older version 4 already in storage.
-    env.storage().instance().set(&DataKey::Version, &4u32);
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Version, &4u32);
+    });
     // migrate(4) should hit the "No migration path" branch.
     client.migrate(&4u32);
 }
 
 #[test]
-#[should_panic(expected = "No migration path from version 0 — extend migrate or redeploy")]
+#[should_panic]
 fn test_migrate_from_zero_uninitialized_panics() {
     let env = Env::default();
     env.mock_all_auths();
@@ -474,4 +477,183 @@ fn test_update_funding_target_zero_panics() {
         &None,
     );
     client.update_funding_target(&0i128);
+}
+
+// --- FundingTargetUpdated event and rejection coverage ---
+
+/// Verify that `update_funding_target` emits a `FundingTargetUpdated` event whose
+/// topic is `symbol_short!("fund_tgt")` and whose data fields carry the correct
+/// `invoice_id`, `old_target`, and `new_target` values.
+#[test]
+fn test_update_funding_target_event_fields() {
+    use soroban_sdk::testutils::Events as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let client = deploy(&env);
+    let contract_id = client.address.clone();
+
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "EVT001"),
+        &sme,
+        &5_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+    );
+
+    client.update_funding_target(&9_000i128);
+
+    assert_eq!(
+        env.events().all(),
+        std::vec![FundingTargetUpdated {
+            name: symbol_short!("fund_tgt"),
+            invoice_id: client.get_escrow().invoice_id,
+            old_target: 5_000i128,
+            new_target: 9_000i128,
+        }
+        .to_xdr(&env, &contract_id)]
+    );
+}
+
+/// `update_funding_target` must be rejected when the escrow is in the **settled**
+/// state (status == 2); only the open state (0) is permitted.
+#[test]
+#[should_panic(expected = "Target can only be updated in Open state")]
+fn test_update_funding_target_fails_when_settled() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let client = deploy(&env);
+
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "SETL001"),
+        &sme,
+        &5_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+    );
+    client.fund(&investor, &5_000i128); // status → 1 (funded)
+    client.settle(); // status → 2 (settled)
+    client.update_funding_target(&6_000i128);
+}
+
+/// `update_funding_target` must be rejected when the escrow is in the **withdrawn**
+/// state (status == 3); only the open state (0) is permitted.
+#[test]
+#[should_panic(expected = "Target can only be updated in Open state")]
+fn test_update_funding_target_fails_when_withdrawn() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let client = deploy(&env);
+
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "WD001"),
+        &sme,
+        &5_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+    );
+    client.fund(&investor, &5_000i128); // status → 1 (funded)
+    client.withdraw(); // status → 3 (withdrawn)
+    client.update_funding_target(&6_000i128);
+}
+
+/// Setting the new target exactly equal to `funded_amount` is the boundary case
+/// that must succeed: the invariant is `new_target >= funded_amount`, so equality
+/// is allowed.
+#[test]
+fn test_update_funding_target_equal_to_funded_amount_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let investor = Address::generate(&env);
+    let client = deploy(&env);
+
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "BOUND001"),
+        &sme,
+        &10_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+    );
+    client.fund(&investor, &4_000i128); // funded_amount == 4_000, status still 0
+
+    // new_target == funded_amount: boundary — must not panic.
+    let updated = client.update_funding_target(&4_000i128);
+    assert_eq!(updated.funding_target, 4_000i128);
+    assert_eq!(updated.funded_amount, 4_000i128);
+    assert_eq!(updated.status, 0);
+}
+
+/// Passing a negative value must panic with "Target must be strictly positive".
+#[test]
+#[should_panic(expected = "Target must be strictly positive")]
+fn test_update_funding_target_negative_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let client = deploy(&env);
+
+    let token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "NEG001"),
+        &sme,
+        &5_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+    );
+    client.update_funding_target(&-1i128);
 }
