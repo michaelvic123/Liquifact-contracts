@@ -616,6 +616,7 @@ impl LiquifactEscrow {
         EscrowInitialized {
             name: symbol_short!("escrow_ii"),
             // Read the stored value so we do not clone an in-memory escrow snapshot.
+            // env.clone(): env is used again after this call for .publish(&env).
             escrow: Self::get_escrow(env.clone()),
         }
         .publish(&env);
@@ -677,6 +678,7 @@ impl LiquifactEscrow {
             "sweep amount exceeds MAX_DUST_SWEEP_AMOUNT"
         );
 
+        // env.clone(): env is used again after this call for treasury/token reads and publish.
         let escrow = Self::get_escrow(env.clone());
         assert!(
             escrow.status == 2 || escrow.status == 3,
@@ -775,6 +777,7 @@ impl LiquifactEscrow {
     /// **Authorization:** [`InvoiceEscrow::admin`]. **Frontrunning:** whichever binding transaction lands
     /// first wins; observers must read on-chain state (or parse events) after finality—there is no replay lock.
     pub fn bind_primary_attestation_hash(env: Env, digest: BytesN<32>) {
+        // env.clone(): env is used again after this call for storage has/set and publish.
         let escrow = Self::get_escrow(env.clone());
         escrow.admin.require_auth();
         assert!(
@@ -803,6 +806,7 @@ impl LiquifactEscrow {
     /// Append a digest to a bounded on-chain log (see [`MAX_ATTESTATION_APPEND_ENTRIES`]) for **versioned**
     /// or incremental attestation updates. Does not replace [`LiquifactEscrow::bind_primary_attestation_hash`].
     pub fn append_attestation_digest(env: Env, digest: BytesN<32>) {
+        // env.clone(): env is used again after this call for storage get/set and publish.
         let escrow = Self::get_escrow(env.clone());
         escrow.admin.require_auth();
 
@@ -851,7 +855,11 @@ impl LiquifactEscrow {
 
     /// Effective yield (bps) for this investor after their **first** deposit; later [`LiquifactEscrow::fund`]
     /// calls add principal at this rate. Defaults to [`InvoiceEscrow::yield_bps`] when unset (legacy positions).
+    ///
+    /// Note: reads `DataKey::Escrow` for the base yield fallback; callers that already hold the
+    /// escrow should prefer reading `DataKey::InvestorEffectiveYield` directly.
     pub fn get_investor_yield_bps(env: Env, investor: Address) -> i64 {
+        // env.clone(): env is used again after this call for the InvestorEffectiveYield read.
         let escrow = Self::get_escrow(env.clone());
         env.storage()
             .instance()
@@ -889,6 +897,7 @@ impl LiquifactEscrow {
         amount: i128,
     ) -> SmeCollateralCommitment {
         assert!(amount > 0, "Collateral amount must be positive");
+        // env.clone(): env is used again after this call for ledger timestamp, storage set, and publish.
         let escrow = Self::get_escrow(env.clone());
         escrow.sme_address.require_auth();
 
@@ -917,6 +926,7 @@ impl LiquifactEscrow {
     /// should use a governed `admin` (multisig or protocol DAO). There is no separate “break glass”
     /// entrypoint in this version — operational playbooks live off-chain.
     pub fn set_legal_hold(env: Env, active: bool) {
+        // env.clone(): env is used again after this call for storage set and publish.
         let escrow = Self::get_escrow(env.clone());
         escrow.admin.require_auth();
 
@@ -983,6 +993,7 @@ impl LiquifactEscrow {
     }
 
     pub fn update_funding_target(env: Env, new_target: i128) -> InvoiceEscrow {
+        // env.clone(): env is used again after this call for storage set and publish.
         let mut escrow = Self::get_escrow(env.clone());
         escrow.admin.require_auth();
 
@@ -1107,7 +1118,11 @@ impl LiquifactEscrow {
             );
         }
 
+        // env.clone(): env is used again after this call for storage writes and publish.
         let mut escrow = Self::get_escrow(env.clone());
+        // Legal hold check is intentionally after the escrow read: the escrow is needed for
+        // status and yield_bps regardless, and hoisting the hold check before the escrow read
+        // would not reduce storage operations (both keys are always read on this path).
         assert!(
             !Self::legal_hold_active(&env),
             "Legal hold blocks new funding while active"
@@ -1124,23 +1139,35 @@ impl LiquifactEscrow {
         let contribution_key = DataKey::InvestorContribution(investor.clone());
         let prev: i128 = env.storage().instance().get(&contribution_key).unwrap_or(0);
 
+        // Hoist UniqueFunderCount read: used for both the cap assertion (below) and the
+        // increment write (after contribution is recorded). A single read covers both uses,
+        // eliminating one storage read on every new-investor funding call.
+        let cur_funder_count: u32 = if prev == 0 {
+            env.storage()
+                .instance()
+                .get(&DataKey::UniqueFunderCount)
+                .unwrap_or(0)
+        } else {
+            0 // prev != 0: count is not needed; skip the read entirely.
+        };
+
         if prev == 0 {
             if let Some(cap) = env
                 .storage()
                 .instance()
                 .get::<DataKey, u32>(&DataKey::MaxUniqueInvestorsCap)
             {
-                let cur: u32 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::UniqueFunderCount)
-                    .unwrap_or(0);
-                assert!(cur < cap, "unique investor cap reached");
+                assert!(cur_funder_count < cap, "unique investor cap reached");
             }
         }
 
+        // Capture the effective yield in a local so the event field can be populated without
+        // a post-write storage read of DataKey::InvestorEffectiveYield.
+        let investor_effective_yield_bps: i64;
+
         if simple_fund {
             if prev == 0 {
+                investor_effective_yield_bps = escrow.yield_bps;
                 env.storage().instance().set(
                     &DataKey::InvestorEffectiveYield(investor.clone()),
                     &escrow.yield_bps,
@@ -1148,6 +1175,13 @@ impl LiquifactEscrow {
                 env.storage()
                     .instance()
                     .set(&DataKey::InvestorClaimNotBefore(investor.clone()), &0u64);
+            } else {
+                // Returning investor: yield was set on first deposit; read it for the event.
+                investor_effective_yield_bps = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::InvestorEffectiveYield(investor.clone()))
+                    .unwrap_or(escrow.yield_bps);
             }
             // If prev > 0, preserve existing effective yield and claim lock
         } else {
@@ -1157,6 +1191,7 @@ impl LiquifactEscrow {
             );
             let eff =
                 Self::effective_yield_for_commitment(&env, escrow.yield_bps, committed_lock_secs);
+            investor_effective_yield_bps = eff;
             env.storage()
                 .instance()
                 .set(&DataKey::InvestorEffectiveYield(investor.clone()), &eff);
@@ -1198,23 +1233,13 @@ impl LiquifactEscrow {
             .set(&contribution_key, &(prev + amount));
 
         if prev == 0 {
-            let cur: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::UniqueFunderCount)
-                .unwrap_or(0);
+            // Use the hoisted cur_funder_count; no second storage read needed.
             env.storage()
                 .instance()
-                .set(&DataKey::UniqueFunderCount, &(cur + 1));
+                .set(&DataKey::UniqueFunderCount, &(cur_funder_count + 1));
         }
 
         env.storage().instance().set(&DataKey::Escrow, &escrow);
-
-        let investor_effective_yield_bps = env
-            .storage()
-            .instance()
-            .get(&DataKey::InvestorEffectiveYield(investor.clone()))
-            .unwrap_or(escrow.yield_bps);
 
         EscrowFunded {
             name: symbol_short!("funded"),
@@ -1223,6 +1248,7 @@ impl LiquifactEscrow {
             amount,
             funded_amount: escrow.funded_amount,
             status: escrow.status,
+            // Local variable set at write time; no post-write storage read required.
             investor_effective_yield_bps,
         }
         .publish(&env);
@@ -1236,6 +1262,7 @@ impl LiquifactEscrow {
             "Legal hold blocks settlement finalization"
         );
 
+        // env.clone(): env is used again after this call for ledger timestamp, storage set, and publish.
         let mut escrow = Self::get_escrow(env.clone());
 
         escrow.sme_address.require_auth();
@@ -1275,6 +1302,7 @@ impl LiquifactEscrow {
             "Legal hold blocks SME withdrawal"
         );
 
+        // env.clone(): env is used again after this call for storage set and publish.
         let mut escrow = Self::get_escrow(env.clone());
         escrow.sme_address.require_auth();
 
@@ -1315,6 +1343,7 @@ impl LiquifactEscrow {
             .unwrap_or(0);
         assert!(contribution > 0, "Address has no contribution to claim");
 
+        // env.clone(): env is used again after this call for storage reads, ledger timestamp, and publish.
         let escrow = Self::get_escrow(env.clone());
         assert!(
             escrow.status == 2,
@@ -1352,6 +1381,7 @@ impl LiquifactEscrow {
     }
 
     pub fn update_maturity(env: Env, new_maturity: u64) -> InvoiceEscrow {
+        // env.clone(): env is used again after this call for storage set and publish.
         let mut escrow = Self::get_escrow(env.clone());
         escrow.admin.require_auth();
 
@@ -1377,6 +1407,7 @@ impl LiquifactEscrow {
     }
 
     pub fn transfer_admin(env: Env, new_admin: Address) -> InvoiceEscrow {
+        // env.clone(): env is used again after this call for storage set and publish.
         let mut escrow = Self::get_escrow(env.clone());
 
         escrow.admin.require_auth();
